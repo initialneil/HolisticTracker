@@ -18,6 +18,8 @@ class ArgumentConfig(PrintableConfig):
     check_hand_score: float = 0.7
     not_check_hand: bool = False
     
+    optim_cfg: str = 'src/configs/optim_configs/ehm_ubody.yaml'  # path to optimization config file
+    
     visible_gpus: Annotated[str, tyro.conf.arg(aliases=["-v"])] = '0,'        # visible gpus, separated by `,`, e.g. 0, 1
     part_lst: Annotated[str, tyro.conf.arg(aliases=["-p"])] = 'nan'           # starts and ends for subprocessing, e.g. 20,40, default: None
     n_divide: Annotated[str, tyro.conf.arg(aliases=["-n"])] = 8               # max divide number
