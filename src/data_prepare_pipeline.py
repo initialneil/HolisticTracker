@@ -7,11 +7,13 @@ import os.path as osp
 import math,shutil,json,torchvision
 from pytorch3d.renderer import PointLights
 from tqdm.auto import tqdm
-from PIL import Image
+from PIL import Image as PILImage
+import shutil
 from .utils.graphics import GS_Camera
 from .utils.lmdb import LMDBEngine
 from .utils.rprint import rlog as log
 from .utils.video import images2video
+from .utils.bbox_utils import crop_image_from_bbox
 from .modules.dwpose import inference_detector
 from .utils.landmark_runner import LandmarkRunner
 from .modules.smplx.utils import orginaze_body_pose
@@ -24,6 +26,12 @@ from .utils.io import load_config, write_dict_pkl, load_dict_pkl
 from .utils.crop import crop_image, parse_bbox_from_landmark_lite, crop_image_by_bbox, _transform_pts
 from .utils.helper import load_onnx_model, instantiate_from_config, image2tensor, image2tensor, get_machine_info
 from .modules.refiner.smplx_utils import smplx_joints_to_dwpose
+
+
+def split_frame_key(frm_key):
+    *segment_id, fn = frm_key.split('_')
+    return '_'.join(segment_id), fn
+
 
 class DataPreparePipeline(object):
     def __init__(self, data_prepare_cfg: DataPreparationConfig):
@@ -99,7 +107,296 @@ class DataPreparePipeline(object):
         R, T = cam2persp_cam_fov_body(wcam, tanfov=self.cfg.tanfov)
         return torch.cat((R, T[..., None]), axis=-1)
     
-    def track_base(self, img_rgb, union_box=None, last_results=None):
+    def extract_frames(self, video_fp, out_lmdb_dir, frame_interval, num_frames):
+        """
+        Extract frames from video and save to LMDB.
+        
+        Args:
+            video_fp: Path to video file
+            out_lmdb_dir: Directory for LMDB database
+            frame_interval: Interval between frames to extract
+            num_frames: Total number of frames in video
+            
+        Returns:
+            Tuple of (all_frames, frames_keys)
+        """
+        log(f"Extracting frames from video: {video_fp}")
+        reader = imageio.get_reader(video_fp)
+        lmdb_engine = LMDBEngine(out_lmdb_dir, write=True)
+        
+        all_frames = []
+        frames_keys = []
+        
+        img_idx = 0
+        for idx in tqdm(range(0, num_frames, frame_interval), 
+                       desc='Extracting frames from video...', 
+                       total=num_frames//frame_interval):
+            img_rgb = reader.get_data(idx)
+            b_name = f'frame_{img_idx:06d}'
+            
+            # Save original image to LMDB
+            lmdb_engine.dump(f'{b_name}/ori_image', 
+                           payload=image2tensor(img_rgb, norm=False), 
+                           type='image')
+            
+            all_frames.append(img_rgb)
+            frames_keys.append(b_name)
+            img_idx += 1
+        
+        reader.close()
+        lmdb_engine.close()
+        
+        log(f"Extracted {len(all_frames)} frames")
+        return all_frames, frames_keys
+
+    def _load_image_from_disk(self, video_name, frame_key, extra_info, to_tensor=False):
+        frames_root = extra_info['frames_root']
+        matte_root = extra_info['matte_root']
+        seg_id, fn = split_frame_key(frame_key)
+        img = np.array(PILImage.open(osp.join(frames_root, video_name, seg_id, f'{fn}.png')))
+        matte = np.array(PILImage.open(osp.join(matte_root, video_name, seg_id, f'{fn}.png')))
+        matte = matte[..., None].repeat(3, -1)
+
+        wbbox_info = extra_info.get('wbbox_info')
+        if wbbox_info is not None:
+            if video_name in wbbox_info:
+                wbbox_info = wbbox_info[video_name]
+            wbbox_xyxy = wbbox_info.get(frame_key)
+            if wbbox_xyxy is not None:
+                wbbox_xyxy = np.array(wbbox_xyxy, dtype=np.float32).squeeze(0)
+                img, _ = crop_image_from_bbox(img, wbbox_xyxy, return_pad_mask=True)
+                matte, pad_mask = crop_image_from_bbox(matte, wbbox_xyxy, return_pad_mask=True)
+
+        if to_tensor:
+            _image = torchvision.transforms.ToTensor()(img)
+            _mask = torchvision.transforms.ToTensor()(matte)
+            return _image, _mask
+        else:
+            return img, matte
+
+    def _load_image_from_lmdb(self, frame_key: str, lmdb_engine: LMDBEngine):
+        if lmdb_engine.exists(f'{frame_key}/body_image'):
+            img_tensor = lmdb_engine[f'{frame_key}/body_image']
+        elif lmdb_engine.exists(f'{frame_key}/ori_image'):
+            img_tensor = lmdb_engine[f'{frame_key}/ori_image']
+        else:
+            return None
+        
+        img_rgb = img_tensor.numpy().transpose(1, 2, 0).astype(np.uint8)
+        return img_rgb
+
+    def load_frames(self, video_name, frames_keys,
+                    extra_info=None, lmdb_dir=None):
+        if lmdb_dir is not None and osp.exists(lmdb_dir):
+            lmdb_engine = LMDBEngine(lmdb_dir, write=False)
+        else:
+            lmdb_engine = None
+
+        all_frames = []
+        for frame_key in tqdm(frames_keys, desc='Loading frames from disk...'):
+            try:
+                img, matte = None, None
+                if lmdb_engine is not None:
+                    img = self._load_image_from_lmdb(frame_key, lmdb_engine)
+
+                if img is None:
+                    img, matte = self._load_image_from_disk(video_name, frame_key, extra_info,
+                                                            to_tensor=False)
+                all_frames.append((img, matte))
+            except Exception as e:
+                log(f"Warning: Could not load frame {frame_key}: {e}")
+        return all_frames
+    
+    def load_frames_from_disk(self, video_name, frames_keys, extra_info):
+        """
+        Load frames from disk using extra info.
+        
+        Args:
+            frames_keys: List of frame keys to load
+            extra_info: Extra info dict containing paths
+        Returns:
+            List of loaded frames (numpy arrays)
+        """
+        log(f"Loading frames from disk using extra info")
+        all_frames = []
+        for frame_key in tqdm(frames_keys, desc='Loading frames from disk...'):
+            try:
+                img, matte = self._load_image_from_disk(video_name, frame_key, extra_info,
+                                                        to_tensor=False)
+                all_frames.append((img, matte))
+            except Exception as e:
+                log(f"Warning: Could not load frame {frame_key}: {e}")
+        return all_frames
+
+    def load_frames_lmdb(self, lmdb_dir, frames_keys):
+        """
+        Load frames from existing LMDB database.
+        
+        Args:
+            lmdb_dir: Directory with LMDB database
+            frames_keys: List of frame keys to load
+            
+        Returns:
+            List of loaded frames (numpy arrays)
+        """
+        log(f"Loading frames from LMDB: {lmdb_dir}")
+        lmdb_engine = LMDBEngine(lmdb_dir, write=False)
+        
+        all_frames = []
+        for frame_key in tqdm(frames_keys, desc='Loading frames from LMDB...'):
+            try:
+                # Try to load from body_image first (processed), fallback to ori_image
+                try:
+                    img_tensor = lmdb_engine[f'{frame_key}/body_image']
+                except:
+                    img_tensor = lmdb_engine[f'{frame_key}/ori_image']
+                
+                img_rgb = img_tensor.numpy().transpose(1, 2, 0).astype(np.uint8)
+                all_frames.append(img_rgb)
+            except Exception as e:
+                log(f"Warning: Could not load frame {frame_key}: {e}")
+        
+        lmdb_engine.close()
+        log(f"Loaded {len(all_frames)} frames")
+        return all_frames
+    
+    def base_track(self, all_frames, frames_keys, out_lmdb_dir, base_track_fp, 
+                   id_share_params_fp, skipped_flag, 
+                   check_hand=True, 
+                   no_body_crop=False,
+                   save_images_to_lmdb=True):
+        """
+        Perform base tracking on frames and save results.
+        
+        Args:
+            all_frames: List of frames (numpy arrays)
+            frames_keys: List of frame keys corresponding to frames
+            out_lmdb_dir: Directory for LMDB database
+            base_track_fp: Path to save base tracking results
+            id_share_params_fp: Path to save identity-shared parameters
+            skipped_flag: Path to skipped flag file
+            check_hand: Whether to check hand validity
+            save_images_to_lmdb: Whether to save processed images to LMDB
+            
+        Returns:
+            Tuple of (base_results, id_share_params_results, success)
+        """
+        log(f"Performing base tracking on {len(all_frames)} frames...")
+        
+        # Cropping
+        if no_body_crop:
+            crop_scale = 1.0
+            img_rgb = all_frames[0]
+            if isinstance(img_rgb, tuple):
+                img_rgb = img_rgb[0]
+            union_box = [0, 0, img_rgb.shape[1], img_rgb.shape[0]]
+        else:
+            crop_scale = 1.1
+            # Compute union bounding box
+            union_bbox = []
+            for img_rgb in tqdm(all_frames, desc='Computing union bbox...'):
+                try:
+                    if isinstance(img_rgb, tuple):
+                        img_rgb = img_rgb[0]
+                    bbox = inference_detector(self.dwpose_detector.pose_estimation.session_det, img_rgb)[0]
+                    union_bbox.append(bbox)
+                except Exception as e:
+                    pass
+            
+            if len(union_bbox) == 0:
+                union_box = None
+            else:
+                uu = np.array(union_bbox)
+                ul, ut, ur, ub = uu[:, 0].min(), uu[:, 1].min(), uu[:, 2].max(), uu[:, 3].max()
+                ucx, ucy = (ul + ur) / 2, (ut + ub) / 2
+                usize = max(ur - ul, ub - ut)
+                union_box = [ucx - usize / 2, ucy - usize / 2, ucx + usize / 2, ucy + usize / 2]
+        
+        # Open LMDB for writing processed images
+        lmdb_engine = LMDBEngine(out_lmdb_dir, write=save_images_to_lmdb) if save_images_to_lmdb else None
+        
+        base_results = {}
+        id_share_params_results = {}
+        
+        with torch.no_grad():
+            last_results = None
+            valid_idx = 0
+            
+            for idx, (img_rgb, b_name) in enumerate(tqdm(zip(all_frames, frames_keys), 
+                                                         desc='Processing base tracking...', 
+                                                         total=len(all_frames))):
+                if isinstance(img_rgb, tuple):
+                    img_rgb, matte_rgb = img_rgb
+                else:
+                    matte_rgb = None
+
+                ret_images, ret_results, shape_results = self.track_base(
+                    img_rgb, union_box, 
+                    last_results=last_results, 
+                    crop_scale=crop_scale,
+                    matte_rgb=matte_rgb)
+                last_results = ret_results
+                
+                if ret_results is None:
+                    log(f"Skipping frame {idx} ({b_name}) due to incomplete facial landmark extraction")
+                    continue
+                
+                if check_hand:
+                    if not ret_results['left_hand_valid'] or not ret_results['right_hand_valid']:
+                        log(f"Skipping frame {idx} ({b_name}) due to missing left or right hand")
+                        continue
+                
+                # Save processed images to LMDB if requested
+                if save_images_to_lmdb and lmdb_engine is not None:
+                    for k, v in ret_images.items():
+                        if k == 'ori_image':  # Skip ori_image as it's already saved
+                            continue
+                        if len(v.shape) == 2:
+                            v = v[:, :, None]
+                        lmdb_engine.dump(f'{b_name}/{k}', payload=image2tensor(v, norm=False), type='image')
+                
+                # Remove per-frame shape parameters
+                del ret_results['flame_coeffs']['shape_params']
+                del ret_results['smplx_coeffs']['shape']
+                base_results[b_name] = ret_results
+                
+                # Collect shape parameters for averaging
+                for k, v in shape_results.items():
+                    if k not in id_share_params_results:
+                        id_share_params_results[k] = []
+                    id_share_params_results[k].append(v)
+                
+                valid_idx += 1
+        
+        if lmdb_engine:
+            lmdb_engine.close()
+        
+        # Check minimum frames requirement
+        if valid_idx < self.cfg.min_frames:
+            log(f"Insufficient valid frames (min required: {self.cfg.min_frames}, found: {valid_idx})")
+            with open(skipped_flag, 'w') as f:
+                f.write(f"Insufficient valid frames (min required: {self.cfg.min_frames}, found: {valid_idx})")
+            return None, None, False
+        
+        # Average shape parameters
+        for k, v in id_share_params_results.items():
+            id_share_params_results[k] = np.array(v).mean(0)
+        
+        # Save results
+        write_dict_pkl(id_share_params_fp, id_share_params_results)
+        write_dict_pkl(base_track_fp, base_results)
+        
+        # Visualize if LMDB was used
+        if save_images_to_lmdb:
+            lmdb_engine = LMDBEngine(out_lmdb_dir, write=False)
+            lmdb_engine.random_visualize(osp.join(out_lmdb_dir, 'visualize.jpg'))
+            lmdb_engine.close()
+        
+        log(f'Base tracking completed with {valid_idx} valid frames')
+        return base_results, id_share_params_results, True
+    
+    def track_base(self, img_rgb, union_box=None, last_results=None, 
+                   crop_scale=1.1, matte_rgb=None):
         ret_images = {}
         base_results = {}
         mean_shape_results = {}
@@ -110,13 +407,22 @@ class DataPreparePipeline(object):
         if det_info['bbox'] is None: 
             print("          Missing box")
             return None, None, None
-        crop_info_hd = crop_image_by_bbox(img_rgb, det_info['bbox'], dsize=self.cfg.body_hd_size) 
-        crop_info  = crop_image_by_bbox(img_rgb, det_info['bbox'],   dsize=self.cfg.body_crop_size) 
+        crop_info_hd = crop_image_by_bbox(img_rgb, det_info['bbox'], dsize=self.cfg.body_hd_size, scale=crop_scale)
+        crop_info  = crop_image_by_bbox(img_rgb, det_info['bbox'],   dsize=self.cfg.body_crop_size, scale=crop_scale) 
         base_results['body_crop'] = {'M_o2c': crop_info['M_o2c'], 'M_c2o': crop_info['M_c2o'], 
                                      'M_o2c-hd': crop_info_hd['M_o2c'], 'M_c2o-hd': crop_info_hd['M_c2o']}
         base_results['dwpose_raw'] = det_raw_info
         base_results['dwpose_rlt'] = {'keypoints': _transform_pts(det_raw_info['keypoints'], crop_info_hd['M_o2c']), 
                                       'scores': det_raw_info['scores'], 'faces': det_info['faces'], 'hands': det_info['hands']}
+
+        # check hand confidence and fingers cross
+        base_results['left_hand_valid'] = base_results['dwpose_rlt']['scores'][-42:-21].mean() >= self.cfg.check_hand_score
+        base_results['right_hand_valid'] = base_results['dwpose_rlt']['scores'][-21:].mean() >= self.cfg.check_hand_score
+        if ((base_results['dwpose_rlt']['keypoints'][-42:-21] - 
+             base_results['dwpose_rlt']['keypoints'][-21:])**2).mean() < self.cfg.check_hand_dist:
+            base_results['left_hand_valid'] = False
+            base_results['right_hand_valid'] = False
+
         img_crop = crop_info['img_crop']
         img_hd   = crop_info_hd['img_crop']
         ret_images['body_image'] = img_hd
@@ -125,7 +431,11 @@ class DataPreparePipeline(object):
         img_hd = image2tensor(img_hd).to(self.device).unsqueeze(0)
 
         # matting related
-        t_matting = self.matte(img_hd.contiguous(), 'alpha')
+        if matte_rgb is None:
+            t_matting = self.matte(img_hd.contiguous(), 'alpha')
+        else:
+            matte_hd = crop_image_by_bbox(matte_rgb, det_info['bbox'], dsize=self.cfg.body_hd_size, scale=crop_scale)['img_crop']
+            t_matting = image2tensor(matte_hd)[0].to(self.device)
         ret_images['body_mask'] = (np.clip(t_matting.cpu().numpy(), 0, 1) * 255).round().astype(np.uint8)
         predict = t_matting.expand(3, -1, -1)
         matting_image = img_hd.clone()[0]
@@ -155,18 +465,22 @@ class DataPreparePipeline(object):
         lmk_mp = self.mp_detector.run(crop_info['img_crop'])['pts']
         
         if lmk203 is None or lmk_mp is None or lmk70 is None:
-            if last_results is not None:
-                base_results.update({'head_lmk_203': last_results['head_lmk_203'], 
-                                     'head_lmk_70':  last_results['head_lmk_70'], 
-                                     'head_lmk_mp':  last_results['head_lmk_mp']})
-            else:
-                return None, None, None
+            # if last_results is not None:
+            #     base_results.update({'head_lmk_203': last_results['head_lmk_203'], 
+            #                          'head_lmk_70':  last_results['head_lmk_70'], 
+            #                          'head_lmk_mp':  last_results['head_lmk_mp']})
+            # else:
+            #     return None, None, None
+            base_results.update({'head_lmk_203': np.zeros((203,2)), 
+                                 'head_lmk_70':  np.zeros((70,2)), 
+                                 'head_lmk_mp':  np.zeros((478,2)),
+                                 'head_lmk_valid': False})
         else:
             if len(lmk203.shape) == 3: lmk203 = lmk203[0]
             if len(lmk70.shape) == 3: lmk70 = lmk70[0]
             if len(lmk_mp.shape) == 3: lmk_mp = lmk_mp[0]
 
-            base_results.update({'head_lmk_203': lmk203, 'head_lmk_70': lmk70, 'head_lmk_mp': lmk_mp})
+            base_results.update({'head_lmk_203': lmk203, 'head_lmk_70': lmk70, 'head_lmk_mp': lmk_mp, 'head_lmk_valid': True})
 
         cropped_image = cv2.resize(crop_info['img_crop'], (self.cfg.teaser_input_size, self.cfg.teaser_input_size))
         cropped_image = np.transpose(cropped_image, (2,0,1))[None, ...] / 255.0
@@ -210,15 +524,15 @@ class DataPreparePipeline(object):
         self.args=args
         for video_idx, video_fp in enumerate(args.source_dir):
             video_name = self.get_video_name(video_fp, 1)
-            saving_root = os.path.join(out_dir, video_name)
+            saving_root = osp.join(out_dir, video_name)
             out_video_fp=video_fp
-            out_lmdb_dir = os.path.join(saving_root, 'img_lmdb')
+            out_lmdb_dir = osp.join(saving_root, 'img_lmdb')
             id_share_params_fp = osp.join(saving_root, 'id_share_params.pkl')
-            base_track_fp = os.path.join(saving_root, 'base_tracking.pkl')
-            skipped_flag = os.path.join(saving_root, f"skipped.txt")
-            optim_track_fp_flame = os.path.join(saving_root, 'optim_tracking_flame.pkl')
-            optim_track_fp_smplx = os.path.join(saving_root, 'optim_tracking_ehm.pkl')
-            videos_info_path = os.path.join(saving_root, 'videos_info.json')
+            base_track_fp = osp.join(saving_root, 'base_tracking.pkl')
+            skipped_flag = osp.join(saving_root, f"skipped.txt")
+            optim_track_fp_flame = osp.join(saving_root, 'optim_tracking_flame.pkl')
+            optim_track_fp_smplx = osp.join(saving_root, 'optim_tracking_ehm.pkl')
+            videos_info_path = osp.join(saving_root, 'videos_info.json')
             os.makedirs(saving_root,exist_ok=True)
             os.makedirs(out_lmdb_dir,exist_ok=True)
             if os.path.exists(skipped_flag) :
@@ -244,57 +558,24 @@ class DataPreparePipeline(object):
                 
                 if not (self.cfg.check_skip_extraction and osp.exists(base_track_fp)):
                     log(f"[{video_idx:04d}/{len(args.source_dir)}] Processing video file: {out_video_fp}")
-                    union_box = self.get_union_human_box_in_video(out_video_fp,frame_interval)
-                    lmdb_engine = LMDBEngine(out_lmdb_dir, write=True)
-                    base_results = {}
-                    id_share_params_results = {}
-                    with torch.no_grad():
-                        last_results = None
-                        img_idx = 0
-                        for idx in tqdm(range(0,num_frames,frame_interval),desc='Extracting feature ...',total=num_frames//frame_interval):
-                            img_rgb=reader.get_data(idx)
-                            b_name = f'frame_{img_idx:06d}'
-                            ret_images, ret_results, shape_results = self.track_base(img_rgb, union_box, last_results)
-                            last_results = ret_results
-                            if ret_results is None:
-                                log(f"Skipping frame {idx} due to incomplete facial landmark extraction")
-                                continue
-                            if not args.not_check_hand:
-                                if ret_results['dwpose_rlt']['scores'][-42:-21].mean()<self.cfg.check_hand_score or \
-                                        ret_results['dwpose_rlt']['scores'][-21:].mean()<self.cfg.check_hand_score or \
-                                ((ret_results['dwpose_rlt']['keypoints'][-42:-21]-ret_results['dwpose_rlt']['keypoints'][-21:])**2).mean()<self.cfg.check_hand_dist :
-                                    
-                                    log(f"Skipping frame {idx} due to due to missing left or right hand")
-                                    continue
-                            
-                            # dump image to lmdb
-                            for k, v in ret_images.items():
-                                if len(v.shape) == 2: 
-                                    v = v[:,:,None]
-                                lmdb_engine.dump(f'{b_name}/{k}', payload=image2tensor(v, norm=False), type='image')
-                            
-                            del ret_results['flame_coeffs']['shape_params'] 
-                            del ret_results['smplx_coeffs']['shape']
-                            base_results[b_name] = ret_results
-                            
-                            for k, v in shape_results.items():
-                                if k not in id_share_params_results: id_share_params_results[k] = []
-                                id_share_params_results[k].append(v)
-                            img_idx+=1
-                            
-                    if img_idx<self.cfg.min_frames:
-                        lmdb_engine.close()
-                        log(f"Skipping {out_video_fp} due to insufficient valid frames (min required: {self.cfg.min_frames}, found: {img_idx})")
-                        with open(skipped_flag, 'w') as f:
-                            f.write(f"Skipping {out_video_fp} due to insufficient valid frames (min required: {self.cfg.min_frames}, found: {img_idx})")
+                    
+                    # Extract frames from video
+                    all_frames, frames_keys = self.extract_frames(
+                        out_video_fp, out_lmdb_dir, frame_interval, num_frames
+                    )
+                    
+                    # Perform base tracking
+                    base_results, id_share_params_results, success = self.base_track(
+                        all_frames, frames_keys, out_lmdb_dir, base_track_fp, 
+                        id_share_params_fp, skipped_flag, 
+                        check_hand=not args.not_check_hand, 
+                        no_body_crop=False,
+                        save_images_to_lmdb=True,
+                    )
+                    
+                    if not success:
                         continue
-                        
-                    for k, v in id_share_params_results.items():
-                        id_share_params_results[k] = np.array(v).mean(0)
-                    write_dict_pkl(id_share_params_fp, id_share_params_results)
-                    lmdb_engine.random_visualize(os.path.join(out_lmdb_dir, 'visualize.jpg'))
-                    lmdb_engine.close()
-                    write_dict_pkl(base_track_fp, base_results)
+                    
                     log(f'Prepare OK: ...{video_fp[-20:]} ==> {saving_root}')
                 else:
                     base_results = load_dict_pkl(base_track_fp)
@@ -302,8 +583,8 @@ class DataPreparePipeline(object):
 
                 if args.save_images:
                     lmdb_engine = LMDBEngine(out_lmdb_dir, write=True)
-                    image_save_dir = os.path.join(saving_root, 'images')
-                    mask_save_dir = os.path.join(saving_root, 'masks')
+                    image_save_dir = osp.join(saving_root, 'images')
+                    mask_save_dir = osp.join(saving_root, 'masks')
                     if os.path.exists(image_save_dir): shutil.rmtree(image_save_dir)
                     if os.path.exists(mask_save_dir): shutil.rmtree(mask_save_dir)
                     os.makedirs(mask_save_dir, exist_ok=True)
@@ -313,8 +594,8 @@ class DataPreparePipeline(object):
                         body_image=lmdb_engine[f'{key}/body_image']/255.0
                         body_mask=lmdb_engine[f'{key}/body_mask']/255.0
                         body_image=torch.cat([body_image,body_mask.mean(dim=0,keepdim=True)],dim=0)
-                        torchvision.utils.save_image(body_image, os.path.join(image_save_dir, f"{key.split('_')[-1]}.png"))
-                        torchvision.utils.save_image(body_mask, os.path.join(mask_save_dir, f"{key.split('_')[-1]}.png"))
+                        torchvision.utils.save_image(body_image, osp.join(image_save_dir, f"{key.split('_')[-1]}.png"))
+                        torchvision.utils.save_image(body_mask, osp.join(mask_save_dir, f"{key.split('_')[-1]}.png"))
                     lmdb_engine.close()
 
                 optimized_result = base_results
@@ -354,7 +635,7 @@ class DataPreparePipeline(object):
                 with open(videos_info_path, 'w', encoding='utf-8') as json_file:
                     json.dump(videos_info, json_file, ensure_ascii=False, indent=4)
                 if args.save_vis_video:
-                    track_video_fp = os.path.join(saving_root, 'viz_tracking.mp4')
+                    track_video_fp = osp.join(saving_root, 'viz_tracking.mp4')
                     if not os.path.exists(track_video_fp):
                         lmdb_engine = LMDBEngine(out_lmdb_dir, write=True)
                         all_images = []
@@ -378,10 +659,10 @@ class DataPreparePipeline(object):
                                 rendered_img = self.body_renderer.render_mesh(xx,cameras,lights=lights,smplx2flame_ind=self.ehm_opt.ehm.smplx.smplx2flame_ind)
                                 t_img  = (rendered_img[:,:3].cpu().numpy()).clip(0, 255).astype(np.uint8)[0].transpose(1,2,0)
                                 if args.save_visual_render:
-                                    os.makedirs(os.path.join(saving_root, 'mesh_rendered'), exist_ok=True)
+                                    os.makedirs(osp.join(saving_root, 'mesh_rendered'), exist_ok=True)
                                     rendered_img=rendered_img.cpu().numpy().clip(0, 255).astype(np.uint8)[0].transpose(1,2,0)
-                                    img_ = Image.fromarray(rendered_img)
-                                    img_.save(os.path.join(saving_root, 'mesh_rendered',f"{str(idx).zfill(5)}.png"))
+                                    img_ = PILImage.fromarray(rendered_img)
+                                    img_.save(osp.join(saving_root, 'mesh_rendered',f"{str(idx).zfill(5)}.png"))
                                 img_inp = lmdb_engine[f'{image_key}/body_image'].numpy().transpose(1,2,0)
                                 img_bld = cv2.addWeighted(img_inp, 0.5, t_img, 0.5, 1)
                                 img_ret = cv2.hconcat([img_inp, t_img, img_bld])
@@ -395,7 +676,7 @@ class DataPreparePipeline(object):
                                     x, y = int(kp[0]), int(kp[1])
                                     cv2.circle(img_bld, (x,y), 3, (0,255,0), -1)
                                 all_images.append(img_ret)
-                        lmdb_engine.random_visualize(os.path.join(out_lmdb_dir, 'visualize.jpg'))
+                        lmdb_engine.random_visualize(osp.join(out_lmdb_dir, 'visualize.jpg'))
                         lmdb_engine.close()
                         images2video(all_images, track_video_fp, fps=30)
                     log(f'Tacking results is saved {video_name[-20:]} ==> {track_video_fp}')
@@ -404,7 +685,7 @@ class DataPreparePipeline(object):
                 log(f"Skipping {out_video_fp} due to error {e}")
                 import traceback
                 log(f"Traceback:{traceback.format_exc()}")
-                skipped_flag = os.path.join(saving_root, f"skipped.txt")
+                skipped_flag = osp.join(saving_root, f"skipped.txt")
                 if os.path.isdir(skipped_flag):
                     try:
                         shutil.rmtree(skipped_flag)
@@ -436,6 +717,263 @@ class DataPreparePipeline(object):
         t_left_mano_coeffs["betas"],t_right_mano_coeffs["betas"]=torch.from_numpy(id_share_params_results["left_mano_shape"]).to(device),torch.from_numpy(id_share_params_results["right_mano_shape"]).to(device)
         return t_flame_coeffs,t_smplx_coeffs,t_left_mano_coeffs,t_right_mano_coeffs
 
+    def refine(self, args: ArgumentConfig, optim_cfg):
+        """
+        Refine processed data by re-optimizing parameters.
+        
+        Assumes:
+        - Frames are already processed and stored in LMDB
+        - pkl files (base_tracking.pkl, optim_tracking_*.pkl) are available
+        - videos_info.json contains frame metadata
+        - May re-extract intermediate files (keypoints) if needed
+        
+        Args:
+            args: ArgumentConfig with output_dir and source_dir
+        """
+        out_dir = args.output_dir
+        log(str(get_machine_info()))
+        self.args = args
+        
+        for video_idx, video_dir in enumerate(args.source_dir):
+            video_name = osp.basename(osp.normpath(video_dir))
+            saving_root = osp.join(out_dir, video_name)
+            
+            # Define file paths
+            base_id_share_params_fp = osp.join(video_dir, 'base_id_share_params.pkl')
+            id_share_params_fp = osp.join(video_dir, 'id_share_params.pkl')
+            base_track_fp = osp.join(video_dir, 'base_tracking.pkl')
+            optim_track_fp_flame = osp.join(video_dir, 'optim_tracking_flame.pkl')
+            optim_track_fp_smplx = osp.join(video_dir, 'optim_tracking_ehm.pkl')
+            videos_info_path = osp.join(video_dir, 'videos_info.json')
+            extra_info_path = osp.join(video_dir, 'extra_info.json')
+            refine_id_share_params_fp = osp.join(saving_root, 'id_share_params.pkl')
+            refine_track_fp_flame = osp.join(saving_root, 'optim_tracking_flame.pkl')
+            refine_track_fp_smplx = osp.join(saving_root, 'optim_tracking_ehm.pkl')
+            out_lmdb_dir = osp.join(saving_root, 'img_lmdb')
+            
+            # # Check if base data exists
+            # if not os.path.exists(base_track_fp):
+            #     log(f"[{video_idx:04d}/{len(args.source_dir)}] Skipping {video_name}: base_tracking.pkl not found")
+            #     continue
+            
+            # if not os.path.exists(out_lmdb_dir):
+            #     log(f"[{video_idx:04d}/{len(args.source_dir)}] Skipping {video_name}: LMDB database not found")
+            #     continue
+            
+            # Load video metadata
+            with open(videos_info_path, 'r', encoding='utf-8') as json_file:
+                videos_info = json.load(json_file)
+                video_data = videos_info.get(video_name, {})
+                frames_keys = video_data['frames_keys']
+
+            # extra info for frame and mask loading
+            if os.path.exists(extra_info_path):
+                with open(extra_info_path, 'r') as f:
+                    extra_info = json.load(f)
+            
+            if len(frames_keys) == 0:
+                log(f"Error: No frame keys found in videos_info.json")
+                continue
+
+            try:
+                # Load existing data
+                log(f"[{video_idx:04d}/{len(args.source_dir)}] Refining: {video_name}")
+                base_results = load_dict_pkl(base_track_fp) if osp.exists(base_track_fp) else None
+                base_id_share_params_results = load_dict_pkl(base_id_share_params_fp) if os.path.exists(base_id_share_params_fp) else {}
+
+                # Redo base track if missing - re-process
+                if base_results is None:
+                    log(f"Base tracking not found, re-processing...")
+                    
+                    # Load frames from LMDB
+                    all_frames = self.load_frames(video_name, frames_keys, 
+                                                  extra_info=extra_info, lmdb_dir=out_lmdb_dir)
+                    
+                    if len(all_frames) == 0:
+                        log(f"Error: No frames could be loaded from LMDB")
+                        continue
+                    
+                    # Perform base tracking on loaded frames
+                    skipped_flag = osp.join(video_dir, "skipped.txt")
+                    no_body_crop = optim_cfg.get('no_body_crop', False)
+                    base_results, base_id_share_params_results, success = self.base_track(
+                        all_frames, frames_keys, out_lmdb_dir, base_track_fp,
+                        base_id_share_params_fp, skipped_flag,
+                        check_hand=not args.not_check_hand,
+                        no_body_crop=no_body_crop,
+                        save_images_to_lmdb=True  # Save newly processed images
+                    )
+                    
+                    if not success:
+                        log(f"Failed to re-process base tracking for {video_name}")
+                        continue
+                    
+                    log(f"Successfully re-processed base tracking for {video_name}")
+                    
+                # Try to load optimized results, fallback to base results
+                id_share_params_results = load_dict_pkl(id_share_params_fp) if os.path.exists(id_share_params_fp) else {}
+
+                if os.path.exists(optim_track_fp_smplx):
+                    optimized_result = load_dict_pkl(optim_track_fp_smplx)
+                elif os.path.exists(optim_track_fp_flame):
+                    optimized_result = load_dict_pkl(optim_track_fp_flame)
+                else:
+                    optimized_result = base_results
+
+                # Update missing keys from base results
+                for key in base_id_share_params_results:
+                    if key not in id_share_params_results:
+                        id_share_params_results[key] = base_id_share_params_results[key]
+
+                for frame_key in optimized_result.keys():
+                    for key in base_results[frame_key]:
+                        if key not in optimized_result[frame_key]:
+                            optimized_result[frame_key][key] = base_results[frame_key][key]
+                        else:
+                            for sub_key in base_results[frame_key][key]:
+                                if sub_key not in optimized_result[frame_key][key]:
+                                    optimized_result[frame_key][key][sub_key] = base_results[frame_key][key][sub_key]
+
+                # Detect frame interval from frame naming
+                frame_interval = 1
+                if len(frames_keys) > 1:
+                    frame_nums = [int(k.split('_')[-1]) for k in frames_keys]
+                    if len(set(np.diff(frame_nums))) == 1:
+                        frame_interval = np.diff(frame_nums)[0]
+
+                # Re-optimize FLAME parameters with stricter criteria
+                if self.cfg.fit_flame and not os.path.exists(refine_track_fp_flame):
+                    log(f"[{video_idx:04d}/{len(args.source_dir)}] Re-refining FLAME parameters: {video_name}")
+                    lmdb_engine = LMDBEngine(out_lmdb_dir, write=False)
+                    self.flame_opt.saving_root = saving_root
+                    
+                    try:
+                        opt_flame_coeff, id_share_params_results = self.flame_opt.run(
+                            optimized_result, id_share_params_results, 
+                            optim_cfg.optim_flame,
+                            lmdb_engine, frame_interval,
+                        )
+                        
+                        # Update results with refined FLAME coefficients
+                        refined_result = {k: v.copy() for k, v in optimized_result.items()}
+                        for key in refined_result.keys():
+                            if key in opt_flame_coeff:
+                                refined_result[key]['flame_coeffs'] = opt_flame_coeff[key]
+                        
+                        write_dict_pkl(refine_track_fp_flame, refined_result)
+                        optimized_result = refined_result
+                        log(f"FLAME refinement completed for {video_name}")
+                    except Exception as e:
+                        log(f"Warning: FLAME refinement failed for {video_name}: {e}")
+                    finally:
+                        lmdb_engine.close()
+                else:
+                    # load previous refined results if exist
+                    if os.path.exists(refine_track_fp_flame):
+                        optimized_result = load_dict_pkl(refine_track_fp_flame)
+                
+                # Re-optimize SMPL-X parameters with stricter criteria
+                if self.cfg.fit_ehm and not os.path.exists(refine_track_fp_smplx):
+                    log(f"[{video_idx:04d}/{len(args.source_dir)}] Re-refining SMPL-X parameters: {video_name}")
+                    lmdb_engine = LMDBEngine(out_lmdb_dir, write=False)
+                    self.ehm_opt.saving_root = saving_root
+                    
+                    try:
+                        opt_smplx_coeff, id_share_params_results = self.ehm_opt.run(
+                            optimized_result, id_share_params_results, 
+                            optim_cfg.optim_ehm,
+                            lmdb_engine, frame_interval,
+                        )
+                        
+                        # Update results with refined SMPL-X coefficients
+                        refined_result = {k: v.copy() for k, v in optimized_result.items()}
+                        for key in refined_result.keys():
+                            if key in opt_smplx_coeff:
+                                refined_result[key]['smplx_coeffs'] = opt_smplx_coeff[key]
+                                # Clean up mano betas if present
+                                if 'left_mano_coeffs' in refined_result[key] and 'betas' in refined_result[key]['left_mano_coeffs']:
+                                    del refined_result[key]['left_mano_coeffs']['betas']
+                                if 'right_mano_coeffs' in refined_result[key] and 'betas' in refined_result[key]['right_mano_coeffs']:
+                                    del refined_result[key]['right_mano_coeffs']['betas']
+                        
+                        shutil.copyfile(videos_info_path, osp.join(saving_root, 'videos_info.json'))
+                        shutil.copyfile(extra_info_path, osp.join(saving_root, 'extra_info.json'))
+                        write_dict_pkl(refine_id_share_params_fp, id_share_params_results)
+                        write_dict_pkl(refine_track_fp_smplx, refined_result)
+                        optimized_result = refined_result
+                        log(f"SMPL-X refinement completed for {video_name}")
+                    except Exception as e:
+                        log(f"Warning: SMPL-X refinement failed for {video_name}: {e}")
+                    finally:
+                        lmdb_engine.close()
+                
+                # Generate refined visualization if requested
+                if args.save_vis_video:
+                    refine_video_fp = osp.join(saving_root, 'viz_refine_tracking.mp4')
+                    
+                    if not os.path.exists(refine_video_fp):
+                        lmdb_engine = LMDBEngine(out_lmdb_dir, write=True)
+                        all_images = []
+                        device = self.cfg.device
+                        cameras_kwargs = self.ehm_opt.build_cameras_kwargs(1, self.ehm_opt.body_focal_length)
+                        
+                        with torch.no_grad():
+                            lights = PointLights(device=self.device, location=[[0.0, -1.0, -100.0]])
+                            for idx, image_key in tqdm(
+                                enumerate(optimized_result.keys()),
+                                desc='Generating refined visualization',
+                                total=len(optimized_result)
+                            ):
+                                t_flame_coeffs, t_smplx_coeffs, t_left_mano_coeffs, t_right_mano_coeffs = \
+                                    self.convert_traking_params(optimized_result, id_share_params_results, image_key, device)
+                                
+                                ret_body = self.ehm_opt.ehm(t_smplx_coeffs, t_flame_coeffs)
+                                xx = ret_body['vertices']
+                                
+                                camera_RT_params = torch.tensor(optimized_result[image_key]['smplx_coeffs']['camera_RT_params']).to(device)
+                                R, T = camera_RT_params.split([3, 1], dim=-1)
+                                T = T.squeeze(-1)
+                                R, T = R[None], T[None]
+                                
+                                cameras = GS_Camera(R=R, T=T, **cameras_kwargs).to(device)
+                                proj_joints = cameras.transform_points_screen(ret_body['joints'], R=R, T=T)
+                                pred_kps2d = smplx_joints_to_dwpose(proj_joints)[0][..., :2]
+                                gt_lmk_2d = optimized_result[image_key]['dwpose_rlt']['keypoints']
+                                
+                                rendered_img = self.body_renderer.render_mesh(
+                                    xx, cameras, lights=lights,
+                                    smplx2flame_ind=self.ehm_opt.ehm.smplx.smplx2flame_ind
+                                )
+                                t_img = (rendered_img[:, :3].cpu().numpy()).clip(0, 255).astype(np.uint8)[0].transpose(1, 2, 0)
+                                
+                                img_inp = lmdb_engine[f'{image_key}/body_image'].numpy().transpose(1, 2, 0)
+                                img_bld = cv2.addWeighted(img_inp, 0.5, t_img, 0.5, 1)
+                                img_ret = cv2.hconcat([img_inp, t_img, img_bld])
+                                
+                                # Draw predicted keypoints in red
+                                for kp in pred_kps2d[0].cpu().numpy():
+                                    x, y = int(kp[0]), int(kp[1])
+                                    cv2.circle(img_bld, (x, y), 3, (0, 0, 255), -1)
+                                
+                                # Draw ground truth keypoints in green
+                                for kp in gt_lmk_2d:
+                                    x, y = int(kp[0]), int(kp[1])
+                                    cv2.circle(img_bld, (x, y), 3, (0, 255, 0), -1)
+                                
+                                all_images.append(img_ret)
+                        
+                        lmdb_engine.close()
+                        images2video(all_images, refine_video_fp, fps=30)
+                        log(f"Refined visualization saved: {video_name} ==> {refine_video_fp}")
+                
+                log(f"Refinement completed for {video_name}")
+                
+            except Exception as e:
+                log(f"Error during refinement of {video_name}: {e}")
+                import traceback
+                log(f"Traceback: {traceback.format_exc()}")
+                continue
+    
     def del_extra_params_values(optim_frame_params):
         del optim_frame_params['body_crop']
         del optim_frame_params['dwpose_raw']
