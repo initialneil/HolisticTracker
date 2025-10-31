@@ -25,3 +25,6 @@ class ArgumentConfig(PrintableConfig):
     n_divide: Annotated[str, tyro.conf.arg(aliases=["-n"])] = 8               # max divide number
     in_root: Annotated[str, tyro.conf.arg(aliases=["-i"])]  = 'assets/videos' # the input video file paths
     more_in_root: Annotated[List[str], tyro.conf.arg(aliases=["-m"])] = field(default_factory=list)
+
+    reversed_order: bool = False
+    

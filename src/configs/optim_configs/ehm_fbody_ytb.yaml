@@ -1,7 +1,7 @@
 # no body crop for scan, use full image w/ gt camera
 no_body_crop: true
 # reset to use base track results
-reset_to_base_track: false
+reset_to_base_track: true
 
 optim_flame:
   steps: 1001
@@ -13,41 +13,39 @@ optim_flame:
   lambda_exp_reg: 0.01
   lambda_pose_reg: 1.0
 
-  # no motion for scan
-  lambda_motion_reg: 0.0
+  # motion reg for video
+  lambda_motion_reg: 10.0
 
-  # no mini batch for scan
-  mini_batch_size: -1
-  # share pose for scan from multi-view
-  share_pose: true
+  # mini batch for video
+  mini_batch_size: 1024
+  share_pose: false
 
 optim_ehm:
   steps: 1001
   share_id: true
 
-  # no mini batch for scan
-  mini_batch_size: -1
-  # share pose for scan from multi-view
-  share_pose: true
+  # mini batch for video
+  mini_batch_size: 1024
+  share_pose: false
 
   # optim
-  optim_camera: false
+  optim_camera: true
 
   # Loss weights for EHM/SMPL-X optimization
-  lambda_3d_head: 5.0
-  lambda_3d_hand_l: 0.25
-  lambda_3d_hand_r: 0.25
-  lambda_3d_z: 2.5
-  lambda_2d_kpt: 0.2
+  lambda_3d_head: 10.0
+  lambda_3d_hand_l: 10.0
+  lambda_3d_hand_r: 10.0
+  lambda_3d_z: 0.1
+  lambda_2d_kpt: 10.0
 
   lambda_prior: 1.0
   lambda_smplx_shape_reg: 0.1
   lambda_mano_shape_reg: 0.1
   lambda_scale_reg: 100.0
-  lambda_joint_offset_reg: 10.0
+  lambda_joint_offset_reg: 1.0
 
   # regularize change from init pose
-  lambda_smplx_pose: 1000.0
+  lambda_smplx_pose: 1.0
 
   # invisible lower-body regularization
   lambda_smplx_pose_reg_base: 1.0
@@ -57,9 +55,9 @@ optim_ehm:
   # hand
   lambda_smplx_hand_pose_reg: 0.1
 
-  # no temporal motion for scan
-  lambda_mtn_body_pose: 0.0
-  lambda_mtn_rot6d: 0.0
-  lambda_mtn_trans: 0.0
-  lambda_mtn_trans_z: 0.0
-  lambda_mtn_vertices: 0.0
+  # temporal motion
+  lambda_mtn_body_pose: 200.0
+  lambda_mtn_rot6d: 100.0
+  lambda_mtn_trans: 100.0
+  lambda_mtn_trans_z: 100.0
+  lambda_mtn_vertices: 1.0
