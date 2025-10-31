@@ -741,11 +741,11 @@ class DataPreparePipeline(object):
             # Define file paths
             base_id_share_params_fp = osp.join(video_dir, 'base_id_share_params.pkl')
             id_share_params_fp = osp.join(video_dir, 'id_share_params.pkl')
-            base_track_fp = osp.join(video_dir, 'base_tracking.pkl')
             optim_track_fp_flame = osp.join(video_dir, 'optim_tracking_flame.pkl')
             optim_track_fp_smplx = osp.join(video_dir, 'optim_tracking_ehm.pkl')
             videos_info_path = osp.join(video_dir, 'videos_info.json')
             extra_info_path = osp.join(video_dir, 'extra_info.json')
+            base_track_fp = osp.join(saving_root, 'base_tracking.pkl')
             refine_id_share_params_fp = osp.join(saving_root, 'id_share_params.pkl')
             refine_track_fp_flame = osp.join(saving_root, 'optim_tracking_flame.pkl')
             refine_track_fp_smplx = osp.join(saving_root, 'optim_tracking_ehm.pkl')
@@ -820,19 +820,26 @@ class DataPreparePipeline(object):
                 else:
                     optimized_result = base_results
 
-                # Update missing keys from base results
-                for key in base_id_share_params_results:
-                    if key not in id_share_params_results:
-                        id_share_params_results[key] = base_id_share_params_results[key]
+                reset_to_base_track = optim_cfg.get('reset_to_base_track', False)
+                if reset_to_base_track:
+                    log(f"Resetting to base tracking results for refinement")
+                    id_share_params_results = base_id_share_params_results
+                    optimized_result = base_results
+                else:
+                    log(f"Using existing optimized results for refinement")
+                    # Update missing keys from base results
+                    for key in base_id_share_params_results:
+                        if key not in id_share_params_results:
+                            id_share_params_results[key] = base_id_share_params_results[key]
 
-                for frame_key in optimized_result.keys():
-                    for key in base_results[frame_key]:
-                        if key not in optimized_result[frame_key]:
-                            optimized_result[frame_key][key] = base_results[frame_key][key]
-                        else:
-                            for sub_key in base_results[frame_key][key]:
-                                if sub_key not in optimized_result[frame_key][key]:
-                                    optimized_result[frame_key][key][sub_key] = base_results[frame_key][key][sub_key]
+                    for frame_key in optimized_result.keys():
+                        for key in base_results[frame_key]:
+                            if key not in optimized_result[frame_key]:
+                                optimized_result[frame_key][key] = base_results[frame_key][key]
+                            elif isinstance(base_results[frame_key][key], dict):
+                                for sub_key in base_results[frame_key][key]:
+                                    if sub_key not in optimized_result[frame_key][key]:
+                                        optimized_result[frame_key][key][sub_key] = base_results[frame_key][key][sub_key]
 
                 # Detect frame interval from frame naming
                 frame_interval = 1

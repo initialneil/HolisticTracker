@@ -261,7 +261,7 @@ class FlameOptimizer(object):
                 'expression_params': batch_flame['expression_params'][_idx].detach().float().cpu().numpy(),
                 'jaw_params': batch_flame['jaw_params'][_idx].detach().float().cpu().numpy(),
                 'neck_pose_params': batch_flame['pose_params'][_idx].detach().float().cpu().numpy()*0,
-                'eye_pose_params': eye_pose_code[_idx].detach().float().cpu().numpy(),
+                'eye_pose_params': batch_flame['eye_pose_params'][_idx].detach().float().cpu().numpy(),
                 'eyelid_params': batch_flame['eyelid_params'][_idx].detach().float().cpu().numpy(),
 
                 'pose_params': batch_flame['pose_params'][idx].detach().float().cpu().numpy(),

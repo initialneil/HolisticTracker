@@ -260,6 +260,15 @@ class EhmOptimizer(object):
             batch_smplx['global_pose'] = global_pose.expand(batch_size, -1)
             batch_smplx['left_hand_pose'] = left_hand_pose.expand(batch_size, -1, -1)
             batch_smplx['right_hand_pose'] = right_hand_pose.expand(batch_size, -1, -1)
+        else:
+            body_pose = body_pose.view(batch_size, -1, 3).float()
+            global_pose = global_pose.view(batch_size, -1).float()
+            left_hand_pose = left_hand_pose.view(batch_size, -1, 3).float()
+            right_hand_pose = right_hand_pose.view(batch_size, -1, 3).float()
+            batch_smplx['body_pose'] = body_pose
+            batch_smplx['global_pose'] = global_pose
+            batch_smplx['left_hand_pose'] = left_hand_pose
+            batch_smplx['right_hand_pose'] = right_hand_pose
 
         for key in batch_smplx:
             if isinstance(batch_smplx[key], torch.Tensor):
@@ -373,8 +382,10 @@ class EhmOptimizer(object):
             pred_hand_l_joint    = proj_joints[:, 20:21, :]
             pred_hand_l_vertices[..., 2] = (pred_hand_l_vertices[..., 2] - pred_hand_l_joint[..., 2])
             if left_hand_valid.sum() > 0:
-                loss_3d_hand_l = self.metric(pred_hand_l_vertices[left_hand_valid][:, self.ehm.mano.selected_vert_ids], 
-                                            ref_hand_l_vertices[left_hand_valid][:, self.ehm.mano.selected_vert_ids]) * lambda_3d_hand_l
+                loss_3d_hand_l = self.metric(
+                    pred_hand_l_vertices[left_hand_valid][:, self.ehm.mano.selected_vert_ids], 
+                    ref_hand_l_vertices[left_hand_valid][:, self.ehm.mano.selected_vert_ids]
+                ) * lambda_3d_hand_l
 
             pred_hand_r_vertices = proj_vertices[:, self.ehm.smplx.smplx2mano_ind['right_hand']]
             pred_hand_r_joint    = proj_joints[:, 21:22, :]
