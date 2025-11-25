@@ -6,6 +6,11 @@ reset_to_base_track: true
 optim_flame:
   steps: 1001
   share_id: true
+
+  # mini batch for video
+  mini_batch_size: 1024
+  share_pose: false
+
   # Loss weights for FLAME optimization
   lambda_lmk_2d: 1.0
   lambda_lmk_203: 1.0
@@ -15,10 +20,6 @@ optim_flame:
 
   # motion reg for video
   lambda_motion_reg: 10.0
-
-  # mini batch for video
-  mini_batch_size: 1024
-  share_pose: false
 
 optim_ehm:
   steps: 1001

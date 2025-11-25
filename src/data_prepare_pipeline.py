@@ -151,11 +151,16 @@ class DataPreparePipeline(object):
 
     def _load_image_from_disk(self, video_name, frame_key, extra_info, to_tensor=False):
         frames_root = extra_info['frames_root']
-        matte_root = extra_info['matte_root']
+        frames_ext = extra_info.get('frames_ext', '.png')
         seg_id, fn = split_frame_key(frame_key)
-        img = np.array(PILImage.open(osp.join(frames_root, video_name, seg_id, f'{fn}.png')))
-        matte = np.array(PILImage.open(osp.join(matte_root, video_name, seg_id, f'{fn}.png')))
-        matte = matte[..., None].repeat(3, -1)
+        img = np.array(PILImage.open(osp.join(frames_root, video_name, seg_id, f'{fn}{frames_ext}')))
+
+        matte_root = extra_info.get('matte_root', None)
+        if matte_root is not None:
+            matte = np.array(PILImage.open(osp.join(matte_root, video_name, seg_id, f'{fn}.png')))
+            matte = matte[..., None].repeat(3, -1)
+        else:
+            matte = None
 
         wbbox_info = extra_info.get('wbbox_info')
         if wbbox_info is not None:
@@ -165,12 +170,16 @@ class DataPreparePipeline(object):
             if wbbox_xyxy is not None:
                 wbbox_xyxy = np.array(wbbox_xyxy, dtype=np.float32).squeeze(0)
                 img, _ = crop_image_from_bbox(img, wbbox_xyxy, return_pad_mask=True)
-                matte, pad_mask = crop_image_from_bbox(matte, wbbox_xyxy, return_pad_mask=True)
+                if matte is not None:
+                    matte, pad_mask = crop_image_from_bbox(matte, wbbox_xyxy, return_pad_mask=True)
 
         if to_tensor:
             _image = torchvision.transforms.ToTensor()(img)
-            _mask = torchvision.transforms.ToTensor()(matte)
-            return _image, _mask
+            if matte is not None:
+                _mask = torchvision.transforms.ToTensor()(matte)
+                return _image, _mask
+            else:
+                return _image, None
         else:
             return img, matte
 
@@ -735,6 +744,7 @@ class DataPreparePipeline(object):
         self.args = args
         
         for video_idx, video_dir in enumerate(args.source_dir):
+            video_root = osp.dirname(video_dir)
             video_name = osp.basename(osp.normpath(video_dir))
             saving_root = osp.join(out_dir, video_name)
             
@@ -770,6 +780,11 @@ class DataPreparePipeline(object):
             if os.path.exists(extra_info_path):
                 with open(extra_info_path, 'r') as f:
                     extra_info = json.load(f)
+            else:
+                extra_info = {
+                    'frames_root': video_root,
+                    'frames_ext': '.jpg',
+                }
             
             if len(frames_keys) == 0:
                 log(f"Error: No frame keys found in videos_info.json")
@@ -904,7 +919,8 @@ class DataPreparePipeline(object):
                                     del refined_result[key]['right_mano_coeffs']['betas']
                         
                         shutil.copyfile(videos_info_path, osp.join(saving_root, 'videos_info.json'))
-                        shutil.copyfile(extra_info_path, osp.join(saving_root, 'extra_info.json'))
+                        if osp.exists(extra_info_path):
+                            shutil.copyfile(extra_info_path, osp.join(saving_root, 'extra_info.json'))
                         write_dict_pkl(refine_id_share_params_fp, id_share_params_results)
                         write_dict_pkl(refine_track_fp_smplx, refined_result)
                         optimized_result = refined_result
