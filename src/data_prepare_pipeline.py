@@ -919,8 +919,9 @@ class DataPreparePipeline(object):
                                     del refined_result[key]['right_mano_coeffs']['betas']
                         
                         shutil.copyfile(videos_info_path, osp.join(saving_root, 'videos_info.json'))
-                        if osp.exists(extra_info_path):
-                            shutil.copyfile(extra_info_path, osp.join(saving_root, 'extra_info.json'))
+                        if extra_info is not None:
+                            with open(osp.join(saving_root, 'extra_info.json'), 'w') as fp:
+                                json.dump(extra_info, fp, ensure_ascii=False, indent=4)
                         write_dict_pkl(refine_id_share_params_fp, id_share_params_results)
                         write_dict_pkl(refine_track_fp_smplx, refined_result)
                         optimized_result = refined_result

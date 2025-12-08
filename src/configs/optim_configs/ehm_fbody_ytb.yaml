@@ -38,6 +38,7 @@ optim_ehm:
   lambda_3d_hand_r: 10.0
   lambda_3d_z: 0.1
   lambda_2d_kpt: 10.0
+  lambda_2d_knee_feet: 100.0  # 10.0x of lambda_2d_kpt
 
   lambda_prior: 1.0
   lambda_smplx_shape_reg: 0.1
@@ -47,6 +48,7 @@ optim_ehm:
 
   # regularize change from init pose
   lambda_smplx_pose: 1.0
+  lambda_smplx_init: 0.1  # Weight for regularizing invalid hands/face towards init pose
 
   # invisible lower-body regularization
   lambda_smplx_pose_reg_base: 1.0
