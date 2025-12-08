@@ -16,13 +16,15 @@ from .onnxdet import inference_detector
 from ...utils.rprint import rlog as log
 
 
-def draw_pose(pose, H, W):
+def draw_pose(pose, H=None, W=None, canvas=None):
     bodies = pose['bodies']
     faces = pose['faces']
     hands = pose['hands']
     candidate = bodies['candidate']
     subset = bodies['subset']
-    canvas = np.zeros(shape=(H, W, 3), dtype=np.uint8)
+    
+    if canvas is None:
+        canvas = np.zeros(shape=(H, W, 3), dtype=np.uint8)
 
     canvas = util.draw_bodypose(canvas, candidate, subset)
 
@@ -31,6 +33,37 @@ def draw_pose(pose, H, W):
     canvas = util.draw_facepose(canvas, faces)
 
     return canvas
+
+
+def det_info_to_pose(det_info, H, W):
+    bodies = det_info['bodies']
+    faces = det_info['faces']
+    hands = det_info['hands']
+
+    bodies = {
+        'subset': bodies['subset'][None],
+        'candidate': np.concatenate([
+            bodies['candidate'][:, 0:1] / W,
+            bodies['candidate'][:, 1:2] / H
+        ], axis=-1)
+    }
+
+    faces = np.concatenate([
+        faces[None, :, 0:1] / W,
+        faces[None, :, 1:2] / H
+    ], axis=-1)
+
+    pose = {
+        'bodies': bodies,
+        'faces': faces,
+        'hands': hands,
+    }
+    return pose
+
+
+def draw_det_info(det_info, H, W):
+    pose = det_info_to_pose(det_info, H, W)
+    return draw_pose(pose, H, W)
 
 
 class DWposeDetector:

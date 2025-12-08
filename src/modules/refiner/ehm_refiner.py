@@ -186,6 +186,8 @@ class EhmOptimizer(object):
         lambda_3d_hand_r = optim_cfg.get('lambda_3d_hand_r', 0.25)
         lambda_3d_z = optim_cfg.get('lambda_3d_z', 2.5)
         lambda_2d_kpt = optim_cfg.get('lambda_2d_kpt', 0.2)
+        lambda_2d_knee_feet = optim_cfg.get('lambda_2d_knee_feet', 2.0)
+        lambda_smplx_init = optim_cfg.get('lambda_smplx_init', 1.0)
         lambda_prior = optim_cfg.get('lambda_prior', 10.0)
         lambda_smplx_shape_reg = optim_cfg.get('lambda_smplx_shape_reg', 0.1)
         lambda_mano_shape_reg = optim_cfg.get('lambda_mano_shape_reg', 0.1)
@@ -214,7 +216,7 @@ class EhmOptimizer(object):
         head_lmk_valid = batch_base['head_lmk_valid']
         left_hand_valid = batch_base['left_hand_valid']
         right_hand_valid = batch_base['right_hand_valid']
-        
+
         b, n = batch_mano_left["hand_pose"][:,0].shape[:2]
         left_hand_pose=converter.batch_matrix2axis(batch_mano_left["hand_pose"][:,0].flatten(0,1)).reshape(b, n*3)#roma.mappings.rotmat_to_rotvec(batch_mano_left["hand_pose"][:,0,...])[:,None,...]
         right_hand_pose=converter.batch_matrix2axis(batch_mano_right["hand_pose"][:,0].flatten(0,1)).reshape(b,1, n, 3)#roma.mappings.rotmat_to_rotvec(batch_mano_right["hand_pose"][:,0,...])[:,None,...] 
@@ -281,6 +283,32 @@ class EhmOptimizer(object):
              batch_mano_right, batch_base['right_hand_crop'],
              batch_base['body_crop'])
 
+
+        # Validate hand tracking by comparing hand vertices to wrist keypoints
+        # Wrist indices: 7 (left wrist), 4 (right wrist)
+        # Elbow indices: 6 (left elbow), 3 (right elbow)
+        left_wrist_kpt2d = gt_lmk_2d['keypoints'][:, 7, :2]
+        left_elbow_kpt2d = gt_lmk_2d['keypoints'][:, 6, :2]
+        right_wrist_kpt2d = gt_lmk_2d['keypoints'][:, 4, :2]
+        right_elbow_kpt2d = gt_lmk_2d['keypoints'][:, 3, :2]
+        
+        # Calculate average wrist-to-elbow distances as threshold
+        left_wrist_elbow_dist = torch.norm(left_wrist_kpt2d - left_elbow_kpt2d, dim=1)
+        right_wrist_elbow_dist = torch.norm(right_wrist_kpt2d - right_elbow_kpt2d, dim=1)
+        
+        # Check left hand validity
+        if left_hand_valid.sum() > 0:
+            left_hand_wrist_3d = ref_hand_l_vertices[:, self.ehm.mano.selected_vert_ids].mean(dim=1)[:, :2]  # Average of selected vertices
+            left_hand_wrist_dist = torch.norm(left_hand_wrist_3d - left_wrist_kpt2d, dim=1)
+            left_hand_valid = left_hand_valid & (left_hand_wrist_dist < left_wrist_elbow_dist)
+        
+        # Check right hand validity
+        if right_hand_valid.sum() > 0:
+            right_hand_wrist_3d = ref_hand_r_vertices[:, self.ehm.mano.selected_vert_ids].mean(dim=1)[:, :2]  # Average of selected vertices
+            right_hand_wrist_dist = torch.norm(right_hand_wrist_3d - right_wrist_kpt2d, dim=1)
+            right_hand_valid = right_hand_valid & (right_hand_wrist_dist < right_wrist_elbow_dist)
+
+
         weight, weight_keep = get_2d_keypoints_weight(body_lmk_score)
         
         _lr_decay=1.0
@@ -299,6 +327,11 @@ class EhmOptimizer(object):
             ref_proj_vertices = cameras.transform_points_screen(smplx_init_dict['vertices'], R=R, T=T)
             ref_proj_joints   = cameras.transform_points_screen(smplx_init_dict['joints'], R=R, T=T)
             ret_body_ref = smplx_joints_to_dwpose(ref_proj_joints)[0]
+            
+            # Extract reference projections for hands and face from initial pose
+            ref_proj_lhand = ref_proj_joints[:, 20:21, :2]  # Left wrist from joints
+            ref_proj_rhand = ref_proj_joints[:, 21:22, :2]  # Right wrist from joints
+            ref_proj_face = ref_proj_joints[:, 15:16, :2]   # Head joint from joints
 
         # optimizer related
         # global_pose.requires_grad = True
@@ -395,14 +428,88 @@ class EhmOptimizer(object):
                                              ref_hand_r_vertices[right_hand_valid][:, self.ehm.mano.selected_vert_ids]) * lambda_3d_hand_r
 
             loss_3d_z = (self.metric(proj_joints[..., 2], ref_proj_joints[..., 2]) + \
-                        self.metric(proj_vertices[..., 2], ref_proj_vertices[..., 2])) * lambda_3d_z
+                         self.metric(proj_vertices[..., 2], ref_proj_vertices[..., 2])) * lambda_3d_z
             
             loss_3d = (loss_3d_head + loss_3d_hand_l + loss_3d_hand_r + loss_3d_z) 
             
             ### 2D landmark loss
             pred_kps3d = smplx_joints_to_dwpose(proj_joints)[0]
-            loss_2d_kpt = self.lmk2d_loss(pred_kps3d[..., :2], gt_lmk_2d['keypoints'].float(), weight=weight) * lambda_2d_kpt
-            loss_2d = loss_2d_kpt
+            
+            # Define keypoint groups
+            # Knee indices: 9 (right knee), 12 (left knee)
+            # Ankle indices: 10 (right ankle), 13 (left ankle)  
+            # Foot indices: 18 (left big toe), 19 (left small toe), 20 (left heel), 21 (right big toe), 22 (right small toe), 23 (right heel)
+            knee_feet_indices = [9, 10, 12, 13, 18, 19, 20, 21, 22, 23]
+            
+            # Face indices: 14-17 (body face points: left eye, right eye, left ear, right ear) + 24-91 (face contour + face landmarks)
+            face_kpt2d_indices = list(range(24, 92))
+            face_kpt2d_indices += [14, 15, 16, 17]
+            
+            # Hand indices: 92-112 (left hand), 113-133 (right hand)
+            # Left elbow and wrist: 6 (left elbow), 7 (left wrist)
+            # Right elbow and wrist: 3 (right elbow), 4 (right wrist)
+            lhand_kpt2d_indices = list(range(92, 113)) + [6, 7]
+            rhand_kpt2d_indices = list(range(113, 134)) + [3, 4]
+            
+            # Body keypoint indices: all indices excluding knee/feet, face, and hands
+            all_kpt2d_indices = list(range(pred_kps3d.shape[1]))
+            body_kpt2d_indices = [i for i in all_kpt2d_indices if i not in knee_feet_indices and i not in face_kpt2d_indices and i not in lhand_kpt2d_indices and i not in rhand_kpt2d_indices]
+            
+            # Body keypoints loss (excluding knee/feet and face)
+            loss_2d_kpt = self.metric(
+                pred_kps3d[:, body_kpt2d_indices, :2], 
+                gt_lmk_2d['keypoints'][:, body_kpt2d_indices, :2].float()
+            ) * lambda_2d_kpt
+            
+            # Knee and feet loss with higher weight
+            loss_2d_knee_feet = self.metric(
+                pred_kps3d[:, knee_feet_indices, :2], 
+                gt_lmk_2d['keypoints'][:, knee_feet_indices, :2].float()
+            ) * lambda_2d_knee_feet
+            
+            # Face landmarks loss (valid: use 2D keypoints, invalid: use init pose projection)
+            loss_2d_face = 0.0
+            if head_lmk_valid.sum() > 0:
+                loss_2d_face = self.metric(
+                    pred_kps3d[head_lmk_valid][:, face_kpt2d_indices, :2], 
+                    gt_lmk_2d['keypoints'][head_lmk_valid][:, face_kpt2d_indices, :2].float()
+                ) * lambda_2d_kpt
+            if (~head_lmk_valid).sum() > 0:
+                # For invalid faces, regularize towards initial pose projection
+                loss_2d_face += self.metric(
+                    pred_kps3d[~head_lmk_valid][:, 15, :2],  # Head joint
+                    ret_body_ref[~head_lmk_valid][:, 15, :2]
+                ) * lambda_smplx_init
+            
+            # Left hand landmarks loss (valid: use 2D keypoints, invalid: use init pose projection)
+            loss_2d_lhand = 0.0
+            if left_hand_valid.sum() > 0:
+                loss_2d_lhand = self.metric(
+                    pred_kps3d[left_hand_valid][:, lhand_kpt2d_indices, :2], 
+                    gt_lmk_2d['keypoints'][left_hand_valid][:, lhand_kpt2d_indices, :2].float()
+                ) * lambda_2d_kpt
+            if (~left_hand_valid).sum() > 0:
+                # For invalid left hands, regularize towards initial pose projection
+                loss_2d_lhand += self.metric(
+                    pred_kps3d[~left_hand_valid][:, 7, :2],  # Left wrist
+                    ret_body_ref[~left_hand_valid][:, 7, :2]
+                ) * lambda_smplx_init
+            
+            # Right hand landmarks loss (valid: use 2D keypoints, invalid: use init pose projection)
+            loss_2d_rhand = 0.0
+            if right_hand_valid.sum() > 0:
+                loss_2d_rhand = self.metric(
+                    pred_kps3d[right_hand_valid][:, rhand_kpt2d_indices, :2], 
+                    gt_lmk_2d['keypoints'][right_hand_valid][:, rhand_kpt2d_indices, :2].float()
+                ) * lambda_2d_kpt
+            if (~right_hand_valid).sum() > 0:
+                # For invalid right hands, regularize towards initial pose projection
+                loss_2d_rhand += self.metric(
+                    pred_kps3d[~right_hand_valid][:, 4, :2],  # Right wrist
+                    ret_body_ref[~right_hand_valid][:, 4, :2]
+                ) * lambda_smplx_init
+            
+            loss_2d = loss_2d_kpt + loss_2d_knee_feet + loss_2d_face + loss_2d_lhand + loss_2d_rhand
 
             ### 3D joint loss and their prior loss
             loss_prior = torch.abs(body_embedding_mean.mean()) * lambda_prior + \
@@ -446,40 +553,79 @@ class EhmOptimizer(object):
                 with torch.no_grad():
                     n_imgs = len(batch_imgs)
                     lights=PointLights(device=self.device, location=[[0.0, -1.0, -10.0]])
-                    img_indices = np.linspace(0, n_imgs - 1, 5, dtype=int)
+                    full_indices = np.linspace(0, n_imgs - 1, min(5, n_imgs), dtype=int)
                     save_path = os.path.join(self.saving_root, "visual_results")
                     os.makedirs(save_path, exist_ok=True)
-                    vis_imgs = []
-                    for im_idx in img_indices:
-                        _img=batch_imgs[im_idx].clone().numpy().transpose(1,2,0)
-                        _t_lmk_dwp=pred_kps3d[im_idx, :,:2]
-                        _landmark_dwp=gt_lmk_2d['keypoints'][im_idx, ...].detach().cpu().numpy()
-                        
-                        _img=draw_landmarks(_landmark_dwp,_img,color=(0, 255, 0),viz_index=False)
-                        _img=draw_landmarks(_t_lmk_dwp,_img,color=(255, 0, 0))
-                        _img=draw_landmarks(proj_face_lmk_203[im_idx,:,:2],_img,color=(0, 0, 255))
-                        t_camera=GS_Camera(**self.build_cameras_kwargs(1,self.body_focal_length),R=R[None,im_idx],T=T[None,im_idx])
-                        mesh_img=self.body_renderer.render_mesh(smplx_dict['vertices'][None,im_idx,...],t_camera,lights=lights) 
-                        mesh_img  = (mesh_img[:,:3].detach().cpu().numpy()).clip(0, 255).astype(np.uint8)[0].transpose(1,2,0)
+                    
+                    # Process images in groups of 10
+                    for group_start in range(0, len(full_indices), 10):
+                        group_end = min(group_start + 10, n_imgs)
+                        img_indices = full_indices[group_start:group_end]
+                        vis_imgs = []
+                        for im_idx in img_indices:
+                            _img=batch_imgs[im_idx].clone().numpy().transpose(1,2,0)
+                            _t_lmk_dwp=pred_kps3d[im_idx, :,:2]
+                            _landmark_dwp=gt_lmk_2d['keypoints'][im_idx, ...].detach().cpu().numpy()
+                            
+                            # Draw lines connecting corresponding landmarks
+                            # Draw body keypoints (always)
+                            for kp_idx in body_kpt2d_indices + knee_feet_indices:
+                                pt1 = tuple(_landmark_dwp[kp_idx].astype(int))
+                                pt2 = tuple(_t_lmk_dwp[kp_idx].detach().cpu().numpy().astype(int))
+                                cv2.line(_img, pt1, pt2, (255, 255, 0), 1)  # Yellow lines
+                                cv2.putText(_img, str(kp_idx), pt1, cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 255), 1)
+                            
+                            # Draw face keypoints (only if face is valid)
+                            if head_lmk_valid[im_idx]:
+                                for kp_idx in face_kpt2d_indices:
+                                    pt1 = tuple(_landmark_dwp[kp_idx].astype(int))
+                                    pt2 = tuple(_t_lmk_dwp[kp_idx].detach().cpu().numpy().astype(int))
+                                    cv2.line(_img, pt1, pt2, (255, 200, 0), 1)  # Orange lines
+                                    cv2.putText(_img, str(kp_idx), pt1, cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 200, 0), 1)
+                            
+                            # Draw left hand keypoints (only if left hand is valid)
+                            if left_hand_valid[im_idx]:
+                                for kp_idx in lhand_kpt2d_indices:
+                                    pt1 = tuple(_landmark_dwp[kp_idx].astype(int))
+                                    pt2 = tuple(_t_lmk_dwp[kp_idx].detach().cpu().numpy().astype(int))
+                                    cv2.line(_img, pt1, pt2, (0, 255, 255), 1)  # Cyan lines
+                                    cv2.putText(_img, str(kp_idx), pt1, cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 255, 255), 1)
+                            
+                            # Draw right hand keypoints (only if right hand is valid)
+                            if right_hand_valid[im_idx]:
+                                for kp_idx in rhand_kpt2d_indices:
+                                    pt1 = tuple(_landmark_dwp[kp_idx].astype(int))
+                                    pt2 = tuple(_t_lmk_dwp[kp_idx].detach().cpu().numpy().astype(int))
+                                    cv2.line(_img, pt1, pt2, (255, 0, 255), 1)  # Magenta lines
+                                    cv2.putText(_img, str(kp_idx), pt1, cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 0, 255), 1)
 
-                        mesh_img=cv2.addWeighted(_img,0.3,mesh_img,0.7,0)
-                        img_hand=batch_imgs[im_idx].clone().numpy().transpose(1,2,0)
-                        img_hand = draw_landmarks(ref_hand_l_joints[im_idx,:,:2], img_hand, color=(0, 0, 255))#left 3d prior
-                        img_hand = draw_landmarks(ref_hand_r_joints[im_idx,:,:2], img_hand, color=(0, 0, 255)) #right 3d prior
-                        img_hand=draw_landmarks(_landmark_dwp[-42:,:],img_hand,color=(0, 255, 0))#green 2d prior
-                        img_hand=draw_landmarks(_t_lmk_dwp[-42:,:],img_hand,color=(255, 0, 0))
-                        if head_lmk_valid[im_idx]:
-                            img_hand=draw_landmarks(ref_head_vertices[im_idx,:,:2],img_hand,color=(255, 0, 255),radius=1)
-                        if left_hand_valid[im_idx]:
-                            img_hand=draw_landmarks(ref_hand_l_vertices[:, self.ehm.mano.selected_vert_ids][im_idx,:,:2],img_hand,color=(255, 0, 255),radius=1)
-                        if right_hand_valid[im_idx]:
-                            img_hand=draw_landmarks(ref_hand_r_vertices[:, self.ehm.mano.selected_vert_ids][im_idx,:,:2],img_hand,color=(255, 0, 255),radius=1)
-                        _img = np.concatenate((_img,mesh_img, img_hand), axis=1)
-                        vis_imgs.append(_img)
+                            
+                            _img=draw_landmarks(_landmark_dwp,_img,color=(0, 255, 0),viz_index=False)
+                            _img=draw_landmarks(_t_lmk_dwp,_img,color=(255, 0, 0))
+                            _img=draw_landmarks(proj_face_lmk_203[im_idx,:,:2],_img,color=(0, 0, 255))
+                            t_camera=GS_Camera(**self.build_cameras_kwargs(1,self.body_focal_length),R=R[None,im_idx],T=T[None,im_idx])
+                            mesh_img=self.body_renderer.render_mesh(smplx_dict['vertices'][None,im_idx,...],t_camera,lights=lights) 
+                            mesh_img  = (mesh_img[:,:3].detach().cpu().numpy()).clip(0, 255).astype(np.uint8)[0].transpose(1,2,0)
 
-                    vis_img = np.concatenate(vis_imgs, axis=0)
-                    cv2.imwrite(os.path.join(save_path,f"vis_fit_smplx_bid-{batch_id}_stp-{i_step}.png"), 
-                                cv2.cvtColor(vis_img.copy(), cv2.COLOR_RGB2BGR))
+                            mesh_img=cv2.addWeighted(_img,0.3,mesh_img,0.7,0)
+                            img_hand=batch_imgs[im_idx].clone().numpy().transpose(1,2,0)
+                            img_hand = draw_landmarks(ref_hand_l_joints[im_idx,:,:2], img_hand, color=(0, 0, 255))#left 3d prior
+                            img_hand = draw_landmarks(ref_hand_r_joints[im_idx,:,:2], img_hand, color=(0, 0, 255)) #right 3d prior
+                            img_hand = draw_landmarks(_landmark_dwp[-42:,:],img_hand,color=(0, 255, 0))#green 2d prior
+                            img_hand = draw_landmarks(_t_lmk_dwp[-42:,:],img_hand,color=(255, 0, 0))
+                            if head_lmk_valid[im_idx]:
+                                img_hand=draw_landmarks(ref_head_vertices[im_idx,:,:2],img_hand,color=(255, 0, 255),radius=1)
+                            if left_hand_valid[im_idx]:
+                                img_hand=draw_landmarks(ref_hand_l_vertices[:, self.ehm.mano.selected_vert_ids][im_idx,:,:2],img_hand,color=(255, 0, 255),radius=1)
+                            if right_hand_valid[im_idx]:
+                                img_hand=draw_landmarks(ref_hand_r_vertices[:, self.ehm.mano.selected_vert_ids][im_idx,:,:2],img_hand,color=(255, 0, 255),radius=1)
+                            _img = np.concatenate((_img,mesh_img, img_hand), axis=1)
+                            vis_imgs.append(_img)
+
+                            if len(vis_imgs) > 0:
+                                vis_img = np.concatenate(vis_imgs, axis=0)
+                                cv2.imwrite(os.path.join(save_path,f"vis_fit_smplx_bid-{batch_id}_stp-{i_step}_grp-{group_start:04d}.png"), 
+                                            cv2.cvtColor(vis_img.copy(), cv2.COLOR_RGB2BGR))
 
         batch_smplx['camera_RT_params'][:, :3, 3] = gl_T.detach()
         # batch_smplx['camera_RT_params'][:, :3, :3] = gl_R.detach()
