@@ -356,6 +356,77 @@ def extract_shot_frames(video_path, shot_key, start_frame, end_frame, shots_fps,
     return len(extracted_frames)
 
 
+def update_existing_json(output_json, video_name, shots_mapping_from, shots_fps):
+    """
+    Update existing JSON file with new shot mapping and remove invalid shots.
+    
+    Args:
+        output_json: Path to the JSON file
+        video_name: Video name
+        shots_mapping_from: Dictionary mapping converted shot keys to original shot keys
+        shots_fps: FPS used when extracting keyframes
+    
+    Returns:
+        Dict with statistics: {'shots': int, 'frames': int, 'skipped_shots': int}
+    """
+    shots_from_key = f"shots_from_{shots_fps}fps"
+    
+    with open(output_json, 'r', encoding='utf-8') as f:
+        metadata = json.load(f)
+    
+    if video_name not in metadata:
+        metadata[video_name] = {}
+    
+    # Get the list of valid converted shot keys from mapping
+    valid_converted_shots = set(shots_mapping_from.keys())
+    
+    # Filter out invalid shots and their frames
+    original_shot_keys = metadata[video_name].get('shot_keys', [])
+    original_frames_keys = metadata[video_name].get('frames_keys', [])
+    original_shot_bboxes = metadata[video_name].get('shot_bbox_xyxy', {})
+    
+    # Keep only shots that are in the valid mapping
+    filtered_shot_keys = [sk for sk in original_shot_keys if sk in valid_converted_shots]
+    
+    # Keep only frames that belong to valid shots
+    filtered_frames_keys = []
+    for frame_key in original_frames_keys:
+        # Extract shot key from frame_key (format: "shot_key/frame_num")
+        frame_shot_key = frame_key.split('/')[0] if '/' in frame_key else None
+        if frame_shot_key in valid_converted_shots:
+            filtered_frames_keys.append(frame_key)
+    
+    # Keep only bboxes for valid shots
+    filtered_shot_bboxes = {sk: bbox for sk, bbox in original_shot_bboxes.items() if sk in valid_converted_shots}
+    
+    # Update metadata
+    metadata[video_name]['shot_keys'] = filtered_shot_keys
+    metadata[video_name]['frames_keys'] = filtered_frames_keys
+    metadata[video_name]['frames_num'] = len(filtered_frames_keys)
+    metadata[video_name]['shot_bbox_xyxy'] = filtered_shot_bboxes
+    metadata[video_name][shots_from_key] = shots_mapping_from
+    
+    # Calculate what was removed
+    removed_shots = len(original_shot_keys) - len(filtered_shot_keys)
+    removed_frames = len(original_frames_keys) - len(filtered_frames_keys)
+    
+    # Save updated metadata
+    with open(output_json, 'w', encoding='utf-8') as f:
+        json.dump(metadata, f, indent=2, ensure_ascii=False)
+    
+    # Print update info
+    if removed_shots > 0 or removed_frames > 0:
+        print(f"  Updated {video_name} JSON: removed {removed_shots} wrong shot(s) and {removed_frames} frame(s)")
+    else:
+        print(f"  Updated {video_name} JSON with {shots_from_key} mapping (skipped extraction)")
+    
+    return {
+        'shots': len(filtered_shot_keys),
+        'frames': len(filtered_frames_keys),
+        'skipped_shots': removed_shots
+    }
+
+
 def process_video(func_args):
     """
     Process one video and extract frames for all shots.
@@ -371,9 +442,10 @@ def process_video(func_args):
             - target_frames: Target frame count per video
             - min_frames: Minimum frame count threshold
             - crop_shot_bbox: Target size for cropping and resizing (e.g., 1024), None to disable
+            - anno_dir: Directory containing annotation JSON files (optional)
     
     Returns:
-        Number of shots processed
+        Dict with statistics: {'shots': int, 'frames': int, 'skipped_shots': int, 'total_shots': int}
     """
     video_name = func_args['video_name']
     videos_dir = func_args['videos_dir']
@@ -383,6 +455,7 @@ def process_video(func_args):
     target_frames = func_args['target_frames']
     min_frames = func_args['min_frames']
     crop_shot_bbox = func_args.get('crop_shot_bbox', None)
+    anno_dir = func_args.get('anno_dir', None)
     # Input paths
     shot_json = Path(shots_dir) / f"{video_name}.json"
     
@@ -422,7 +495,7 @@ def process_video(func_args):
     
     if fps_result['skip']:
         print(f"Skipping {video_name}: No FPS option gives at least {min_frames} frames")
-        return 0
+        return {'shots': 0, 'frames': 0, 'skipped_shots': 0, 'total_shots': len(shot_keys)}
     
     extract_fps = fps_result['best_fps']
     estimated_frames = fps_result['estimated_frames']
@@ -431,11 +504,8 @@ def process_video(func_args):
     output_dir = Path(images_dir) / video_name
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Skip if json exist
+    # Check if json exists and update it with shot mapping before skipping
     output_json = output_dir / f"{video_name}.json"
-    if output_json.exists():
-        print(f"  Skipping {video_name}, output JSON already exists: {output_json}")
-        return 0
     
     # Get video's real FPS
     try:
@@ -446,16 +516,79 @@ def process_video(func_args):
         print(f"Processing {video_name}: {len(shot_keys)} shot(s), extract FPS: {extract_fps}")
         video_fps = None
     
+    # Determine effective FPS for conversion
+    effective_extract_fps = extract_fps if extract_fps is not None else video_fps
+    
+    # Load wrong annotations if anno_dir is provided
+    wrong_frames = set()
+    if anno_dir is not None:
+        anno_file = Path(anno_dir) / f"{video_name}.json"
+        if anno_file.exists():
+            try:
+                with open(anno_file, 'r', encoding='utf-8') as f:
+                    anno_data = json.load(f)
+                wrong_list = anno_data.get('wrong', [])
+                wrong_frames = set(wrong_list)
+                if len(wrong_frames) > 0:
+                    print(f"  Loaded {len(wrong_frames)} wrong frame annotations")
+            except Exception as e:
+                print(f"  Warning: Could not load annotations: {e}")
+    
+    # Build shots mapping first (for both new processing and updating existing JSON)
+    shots_mapping_to = {}  # Map original shot name to converted shot name
+    shots_mapping_from = {}  # Map converted shot name to original shot name (for JSON)
+    needs_conversion = (effective_extract_fps is not None and effective_extract_fps != shots_fps)
+    
+    for shot_key in shot_keys:
+        # Parse shot_key to get start and end frame
+        parts = shot_key.split('_')
+        if len(parts) != 2:
+            continue
+        
+        start_frame, end_frame = parts
+        
+        # Skip single-frame shots
+        if start_frame == end_frame:
+            continue
+
+        # Filter by annotation: if a wrong frame exists in the shot, skip the shot
+        shot_has_wrong_frame = False
+        if len(wrong_frames) > 0:
+            shot_start_num = int(start_frame)
+            shot_end_num = int(end_frame)
+            for frame_num in range(shot_start_num, shot_end_num + 1):
+                frame_key = f"{frame_num:06d}"
+                if frame_key in wrong_frames:
+                    shot_has_wrong_frame = True
+                    break
+        
+        # Skip shots with wrong frames
+        if shot_has_wrong_frame:
+            continue
+        
+        # Convert shot_key to extract_fps frame numbers if needed
+        converted_shot_key = convert_shot_key(shot_key, shots_fps, effective_extract_fps) if needs_conversion else shot_key
+        shots_mapping_to[shot_key] = converted_shot_key
+        shots_mapping_from[converted_shot_key] = shot_key
+    
+    # Count total shots (excluding single-frame shots)
+    total_shots_in_mapping = len(shots_mapping_to)
+    
+    # If JSON exists, update it with shots_mapping_from and remove wrong shots
+    if output_json.exists():
+        update_stats = update_existing_json(output_json, video_name, shots_mapping_from, shots_fps)
+        update_stats['total_shots'] = total_shots_in_mapping
+        return update_stats
+    
     shots_processed = 0
     total_frames = 0
+    skipped_shots = 0
+    total_shots_count = len([sk for sk in shot_keys if len(sk.split('_')) == 2 and sk.split('_')[0] != sk.split('_')[1]])
     
     # Metadata for output JSON
     extracted_shot_keys = []
     all_frames_keys = []
     shot_bboxes = {}  # Store union bbox for each shot
-    
-    # Determine effective FPS for conversion
-    effective_extract_fps = extract_fps if extract_fps is not None else video_fps
     
     # Get frames_keys with bbox info from the original shot JSON
     original_frames_keys = video_data.get('frames_keys', {})
@@ -472,13 +605,16 @@ def process_video(func_args):
         # Skip single-frame shots
         if start_frame == end_frame:
             print(f"  Skipping single-frame shot: {shot_key}")
+            skipped_shots += 1
             continue
         
-        # Convert shot_key to extract_fps frame numbers
-        if effective_extract_fps is not None and effective_extract_fps != shots_fps:
-            converted_shot_key = convert_shot_key(shot_key, shots_fps, effective_extract_fps)
-        else:
-            converted_shot_key = shot_key
+        # Get converted shot key from pre-built mapping
+        converted_shot_key = shots_mapping_to.get(shot_key)
+        
+        if converted_shot_key is None:
+            print(f"  Warning: No converted key found for {shot_key}")
+            skipped_shots += 1
+            continue
 
         # Update start_frame and end_frame from converted_shot_key
         conv_parts = converted_shot_key.split('_')
@@ -540,23 +676,28 @@ def process_video(func_args):
         else:
             print(f"  Warning: No frames extracted for {shot_key}")
     
-    # Save metadata JSON
+    # Build the shots_from_<fps>fps key name
+    shots_from_key = f"shots_from_{shots_fps}fps"
+    
+    # Create new metadata with shots_mapping_from (converted -> original)
     metadata = {
         video_name: {
             "frames_num": total_frames,
             "frames_keys": all_frames_keys,
             "shot_keys": extracted_shot_keys,
             "shot_bbox_xyxy": shot_bboxes,
-            "fps": effective_extract_fps
+            "fps": effective_extract_fps,
+            shots_from_key: shots_mapping_from
         }
     }
     
+    # Save metadata JSON
     with open(output_json, 'w', encoding='utf-8') as f:
         json.dump(metadata, f, indent=2, ensure_ascii=False)
     
-    print(f"  Total: {shots_processed} shot(s), {total_frames} frames")
+    print(f"  Extracted: {shots_processed} shot(s), {total_frames} frames | Skipped: {skipped_shots} shot(s)")
     print(f"  Saved metadata to {output_json}")
-    return shots_processed
+    return {'shots': shots_processed, 'frames': total_frames, 'skipped_shots': skipped_shots, 'total_shots': total_shots_count}
 
 
 def main():
@@ -575,6 +716,8 @@ def main():
                         help='Output directory for extracted images')
     parser.add_argument('--crop_shot_bbox', type=int, default=1024,
                         help='Target size for cropping and resizing frames (default: 1024). Set to 0 to disable cropping.')
+    parser.add_argument('--anno_dir', type=str, default=None,
+                        help='Directory containing annotation JSON files (optional). If provided, shots with wrong frames will be skipped.')
     
     args = parser.parse_args()
     
@@ -622,20 +765,32 @@ def main():
             'shots_fps': args.shots_fps,
             'target_frames': args.target_frames,
             'min_frames': args.min_frames,
-            'crop_shot_bbox': crop_size
+            'crop_shot_bbox': crop_size,
+            'anno_dir': args.anno_dir
         })
     
     # Process videos in parallel
     print(f"\nProcessing videos in parallel...")
     results = parallel_foreach(process_video, func_args_list, max_workers=8)
     
-    # Calculate total shots
-    total_shots = sum(results)
+    # Calculate comprehensive statistics
+    total_shots_extracted = sum(r['shots'] for r in results)
+    total_frames_extracted = sum(r['frames'] for r in results)
+    total_shots_skipped = sum(r['skipped_shots'] for r in results)
+    total_shots_available = sum(r['total_shots'] for r in results)
+    videos_with_frames = sum(1 for r in results if r['frames'] > 0)
+    shots_with_frames = sum(r['shots'] for r in results if r['shots'] > 0)
+    
+    avg_frames_per_video = total_frames_extracted / videos_with_frames if videos_with_frames > 0 else 0
+    avg_frames_per_shot = total_frames_extracted / shots_with_frames if shots_with_frames > 0 else 0
     
     print(f"\n{'='*60}")
     print(f"Processing complete!")
     print(f"Total videos processed: {len(videos_list)}")
-    print(f"Total shots extracted: {total_shots}")
+    print(f"Total shots: {total_shots_available} | Extracted: {total_shots_extracted} | Skipped: {total_shots_skipped}")
+    print(f"Total frames extracted: {total_frames_extracted}")
+    print(f"Average frames per video: {avg_frames_per_video:.1f}")
+    print(f"Average frames per shot: {avg_frames_per_shot:.1f}")
     print(f"Output directory: {images_dir}")
 
 

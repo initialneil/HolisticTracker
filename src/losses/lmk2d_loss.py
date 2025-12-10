@@ -32,6 +32,8 @@ class Landmark2DLoss(nn.Module):
         """
 
         _x, _y = x, y
+        if _x.shape[0] == 0:
+            return torch.tensor(0.0, device=x.device)
 
         if _x.shape[1] == 203:
             # return 0
