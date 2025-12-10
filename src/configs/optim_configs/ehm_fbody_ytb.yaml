@@ -4,7 +4,7 @@ no_body_crop: true
 reset_to_base_track: true
 
 optim_flame:
-  steps: 1001
+  steps: 101
   share_id: true
 
   # mini batch for video
@@ -22,7 +22,7 @@ optim_flame:
   lambda_motion_reg: 10.0
 
 optim_ehm:
-  steps: 1001
+  steps: 201
   share_id: true
 
   # mini batch for video
