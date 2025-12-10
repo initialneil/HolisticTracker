@@ -19,7 +19,7 @@ optim_flame:
   lambda_pose_reg: 1.0
 
   # motion reg for video
-  lambda_motion_reg: 10.0
+  lambda_motion_reg: 0.01
 
 optim_ehm:
   steps: 201
