@@ -65,10 +65,10 @@ class ShotAnnotatorGradio:
             idx: Index in shot_files list
         
         Returns:
-            Tuple of (display_image, info_text, slider_value)
+            Tuple of (display_image, info_text, slider_value, checkbox_value)
         """
         if idx < 0 or idx >= len(self.shot_files):
-            return None, f"Invalid shot index: {idx}", idx
+            return None, f"Invalid shot index: {idx}", idx, gr.update(value=False)
         
         # Save current annotations before loading new shot
         if self.current_video_name is not None:
@@ -82,12 +82,12 @@ class ShotAnnotatorGradio:
         # Load image
         self.current_image = cv2.imread(str(shot_file))
         if self.current_image is None:
-            return None, f"Error: Cannot load image {shot_file}", idx
+            return None, f"Error: Cannot load image {shot_file}", idx, gr.update(value=False)
         
         # Load JSON
         json_file = self.shots_dir / f"{self.current_video_name}.json"
         if not json_file.exists():
-            return None, f"Error: JSON not found {json_file}", idx
+            return None, f"Error: JSON not found {json_file}", idx, gr.update(value=False)
         
         with open(json_file, 'r', encoding='utf-8') as f:
             self.current_json_data = json.load(f)
@@ -113,7 +113,7 @@ class ShotAnnotatorGradio:
         # Generate info text
         info_text = self.generate_info_text()
         
-        return display_img, info_text, idx
+        return display_img, info_text, idx, gr.update(value=False)
     
     def calculate_grid_positions(self):
         """Calculate grid positions from image dimensions."""
@@ -440,7 +440,7 @@ class ShotAnnotatorGradio:
             slider_value: Slider position (0 to len(shot_files)-1)
         
         Returns:
-            Tuple of (display_image, info_text, slider_value)
+            Tuple of (display_image, info_text, slider_value, checkbox_value)
         """
         idx = int(slider_value)
         return self.load_shot(idx)
@@ -466,6 +466,50 @@ class ShotAnnotatorGradio:
             self.user_anno[frame_key] = not is_wrong
         
         # Update display
+        return self.generate_display_image(), self.generate_info_text()
+    
+    def mark_first_frame(self, is_correct):
+        """
+        Mark the first frame of each shot as correct or wrong and propagate.
+        
+        Args:
+            is_correct: True for correct, False for wrong
+        """
+        if self.current_image is None:
+            return None, "No image loaded"
+            
+        if not self.frames_keys:
+            return self.generate_display_image(), self.generate_info_text()
+            
+        # Get frames data to check shot_key
+        video_data = self.current_json_data.get(self.current_video_name, {})
+        frames_keys_dict = video_data.get('frames_keys', {})
+        
+        # Group frames by shot_key
+        shots_frames = {}
+        for frame_key in self.frames_keys:
+            frame_data = frames_keys_dict.get(frame_key, {})
+            shot_key = frame_data.get('shot_key', 'default')
+            
+            if shot_key not in shots_frames:
+                shots_frames[shot_key] = []
+            shots_frames[shot_key].append(frame_key)
+            
+        # Find first frame for each shot and mark it
+        for shot_key, frames in shots_frames.items():
+            if not frames:
+                continue
+            # Sort frames to find the first one
+            sorted_frames = sorted(frames)
+            first_frame_key = sorted_frames[0]
+            
+            # Update annotation
+            self.user_anno[first_frame_key] = is_correct
+            self.auto_anno.pop(first_frame_key, None)
+        
+        # Propagate
+        self.propagate_annotation(None, None)
+        
         return self.generate_display_image(), self.generate_info_text()
     
     def manual_save(self):
@@ -502,8 +546,9 @@ def create_gradio_interface(annotator):
                 e.preventDefault(); // Prevent browser save dialog
                 document.getElementById('save-btn').click();
             }
-            // X for toggle wrong marking checkbox
-            else if (e.key === 'x' || e.key === 'X') {
+            // Space for toggle wrong marking checkbox
+            else if (e.key === ' ') {
+                e.preventDefault();
                 // Find the checkbox by elem_id and then find the actual input element
                 const checkboxContainer = document.getElementById('wrong-checkbox');
                 if (checkboxContainer) {
@@ -513,12 +558,15 @@ def create_gradio_interface(annotator):
                     }
                 }
             }
-            // A for mark all
+            // A for mark first correct
             else if (e.key === 'a' || e.key === 'A') {
-                const markAllBtn = document.getElementById('mark-all-btn');
-                if (markAllBtn) {
-                    markAllBtn.click();
-                }
+                const btn = document.getElementById('mark-first-correct-btn');
+                if (btn) btn.click();
+            }
+            // Z for mark first wrong
+            else if (e.key === 'z' || e.key === 'Z') {
+                const btn = document.getElementById('mark-first-wrong-btn');
+                if (btn) btn.click();
             }
         });
         
@@ -528,7 +576,7 @@ def create_gradio_interface(annotator):
     
     with gr.Blocks(title="Shot Annotation Tool", js=js_code) as demo:
         gr.Markdown("# 🎬 Shot Annotation Tool")
-        gr.Markdown("Click on grids to annotate frames. **Click** = ✅ Correct (green), **Checkbox ON + Click** = ❌ Wrong (red) | Press **X** to toggle | **A** to mark all")
+        gr.Markdown("Click on grids to annotate frames. **Click** = ✅ Correct (green), **Checkbox ON + Click** = ❌ Wrong (red) | Press **Space** to toggle | **A** to mark first correct | **Z** to mark first wrong")
         
         with gr.Row():
             with gr.Column(scale=3):
@@ -544,8 +592,8 @@ def create_gradio_interface(annotator):
                 # Info panel
                 info_output = gr.Markdown(label="Information")
                 
-                # Wrong marking checkbox (toggle with X key)
-                shift_checkbox = gr.Checkbox(label="Mark as WRONG (toggle with X key)", value=False, elem_id="wrong-checkbox")
+                # Wrong marking checkbox (toggle with Space key)
+                shift_checkbox = gr.Checkbox(label="Mark as WRONG (toggle with Space)", value=False, elem_id="wrong-checkbox")
                 
                 # Navigation controls
                 gr.Markdown("### Navigation")
@@ -556,8 +604,10 @@ def create_gradio_interface(annotator):
                 
                 next_non_anno_btn = gr.Button("⏭️ Next Non-Annotated", variant="primary")
                 
-                # Mark all button
-                mark_all_btn = gr.Button("✓ Mark All (A)", variant="secondary", elem_id="mark-all-btn")
+                # Mark first frame buttons
+                with gr.Row():
+                    mark_first_correct_btn = gr.Button("✅ First Correct (A)", variant="secondary", elem_id="mark-first-correct-btn")
+                    mark_first_wrong_btn = gr.Button("❌ First Wrong (Z)", variant="secondary", elem_id="mark-first-wrong-btn")
                 
                 # Slider
                 slider = gr.Slider(
@@ -586,27 +636,34 @@ def create_gradio_interface(annotator):
         prev_btn.click(
             fn=annotator.go_previous,
             inputs=None,
-            outputs=[image_output, info_output, slider]
+            outputs=[image_output, info_output, slider, shift_checkbox]
         )
         
         # Next button
         next_btn.click(
             fn=annotator.go_next,
             inputs=None,
-            outputs=[image_output, info_output, slider]
+            outputs=[image_output, info_output, slider, shift_checkbox]
         )
         
         # Next non-annotated button
         next_non_anno_btn.click(
             fn=annotator.go_next_non_annotated,
             inputs=None,
-            outputs=[image_output, info_output, slider]
+            outputs=[image_output, info_output, slider, shift_checkbox]
         )
         
-        # Mark all button
-        mark_all_btn.click(
-            fn=annotator.mark_all,
-            inputs=[shift_checkbox],
+        # Mark first correct button
+        mark_first_correct_btn.click(
+            fn=lambda: annotator.mark_first_frame(True),
+            inputs=None,
+            outputs=[image_output, info_output]
+        )
+        
+        # Mark first wrong button
+        mark_first_wrong_btn.click(
+            fn=lambda: annotator.mark_first_frame(False),
+            inputs=None,
             outputs=[image_output, info_output]
         )
         
@@ -614,7 +671,7 @@ def create_gradio_interface(annotator):
         slider.change(
             fn=annotator.go_to_shot,
             inputs=[slider],
-            outputs=[image_output, info_output, slider]
+            outputs=[image_output, info_output, slider, shift_checkbox]
         )
         
         # Save button
@@ -628,7 +685,7 @@ def create_gradio_interface(annotator):
         demo.load(
             fn=lambda: annotator.load_shot(0),
             inputs=None,
-            outputs=[image_output, info_output, slider]
+            outputs=[image_output, info_output, slider, shift_checkbox]
         )
     
     return demo
@@ -642,8 +699,8 @@ def main():
                        help='Directory to save annotations')
     parser.add_argument('--grid_size', type=int, default=138,
                        help='Height of each grid cell including 10px indicator (default: 138, image is 128x128 + 10px indicator)')
-    parser.add_argument('--port', type=int, default=9061,
-                       help='Port to run Gradio server (default: 7860)')
+    parser.add_argument('--port', type=int, default=8091,
+                       help='Port to run Gradio server (default: 8081)')
     parser.add_argument('--share', action='store_true',
                        help='Create a public share link')
     
