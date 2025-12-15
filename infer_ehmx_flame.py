@@ -23,27 +23,7 @@ from src.configs.data_prepare_config import DataPreparationConfig
 from src.ehmx_refine_flame import RefineFlamePipeline
 from src.utils.io import load_dict_pkl, write_dict_pkl
 from src.utils.draw import draw_landmarks
-
-
-def load_image(image_path):
-    """Load image from disk as RGB numpy array."""
-    return np.array(PILImage.open(image_path).convert('RGB'))
-
-
-def load_matte(matte_path):
-    """Load single-channel matte image from disk as alpha mask."""
-    if not os.path.exists(matte_path):
-        return None
-    matte = np.array(PILImage.open(matte_path).convert('L')).astype(np.float32) / 255.0
-    return matte
-
-
-def apply_matte_to_image(img_rgb, matte, background_color=1.0):
-    """Apply matte alpha mask to RGB image with white background."""
-    img_float = img_rgb.astype(np.float32) / 255.0
-    matte_3ch = matte[:, :, None]
-    matted = img_float * matte_3ch + background_color * (1 - matte_3ch)
-    return (np.clip(matted, 0, 1) * 255).round().astype(np.uint8)
+from src.ehmx_track_base import load_frame_image, load_matte, apply_matte_to_image
 
 
 def load_track_results(track_pkl_path):
@@ -67,7 +47,7 @@ def load_id_share_params(id_share_pkl_path):
         }
 
 
-def load_head_images(video_name, frames_keys, base_results, images_dir, mattes_dir=None):
+def load_head_images(video_name, frames_keys, base_results, images_dir, mattes_dir=None, pshuman_dir=None):
     """
     Load and crop head images for all frames.
     
@@ -89,11 +69,7 @@ def load_head_images(video_name, frames_keys, base_results, images_dir, mattes_d
             continue
         
         # Load original image
-        img_path = os.path.join(images_dir, video_name, f"{frame_key}.jpg")
-        if not os.path.exists(img_path):
-            continue
-        
-        img_rgb = load_image(img_path)
+        img_rgb = load_frame_image(images_dir, video_name, frame_key, pshuman_dir)
         
         # Apply matte if available
         if mattes_dir:
@@ -159,12 +135,12 @@ def process_video_flame(video_name, video_data, args, flame_pipeline, cfg, optim
             base_results = load_track_results(track_pkl_path)
             
             # Load head images
-            head_images = load_head_images(video_name, frames_keys, base_results, 
-                                         args.images_dir, args.mattes_dir)
+            head_images = load_head_images(video_name, frames_keys, base_results,
+                                           args.images_dir, args.mattes_dir, args.pshuman_dir)
             
             # Generate preview using pipeline method
             flame_pipeline.generate_preview(frames_keys, base_results, refined_results, 
-                                          head_images, preview_path, id_share_params)
+                                            head_images, preview_path, id_share_params)
             
             return refined_results, id_share_params
         else:
@@ -183,7 +159,7 @@ def process_video_flame(video_name, video_data, args, flame_pipeline, cfg, optim
     # Load head images from original images
     print(f"  Loading head images from: {args.images_dir}")
     head_images = load_head_images(video_name, frames_keys, base_results, 
-                                   args.images_dir, args.mattes_dir)
+                                   args.images_dir, args.mattes_dir, args.pshuman_dir)
     
     # Set saving root for flame pipeline
     flame_pipeline.saving_root = video_out_dir
@@ -217,7 +193,7 @@ def process_video_flame(video_name, video_data, args, flame_pipeline, cfg, optim
         
         # Generate preview using pipeline method
         flame_pipeline.generate_preview(frames_keys, base_results, refined_results,
-                                       head_images, preview_path, id_share_params)
+                                        head_images, preview_path, id_share_params)
         
         print(f"  ✓ FLAME refinement completed for {video_name}")
         
@@ -238,6 +214,8 @@ def main():
                         help='JSON file with videos and frames to process')
     parser.add_argument('--mattes_dir', type=str, default=None,
                         help='Directory containing matte images (optional)')
+    parser.add_argument('--pshuman_dir', type=str, default=None,
+                        help='Root directory containing pshuman images')
     parser.add_argument('--ehmx_dir', type=str, required=True,
                         help='Directory for EHM-X tracking results')
     parser.add_argument('--config', type=str,

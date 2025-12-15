@@ -15,6 +15,58 @@ from .modules.smplx.utils import orginaze_body_pose
 from .modules.renderer.util import cam2persp_cam_fov, cam2persp_cam_fov_body
 
 
+def load_image(image_path):
+    """Load image from disk as RGB numpy array."""
+    return np.array(PILImage.open(image_path).convert('RGB'))
+
+
+def load_matte(matte_path):
+    """Load single-channel matte image from disk as alpha mask."""
+    if not os.path.exists(matte_path):
+        return None
+    # Load as grayscale and normalize to [0, 1]
+    matte = np.array(PILImage.open(matte_path).convert('L')).astype(np.float32) / 255.0
+    return matte
+
+
+def load_frame_image(images_dir, video_name, frame_key, pshuman_dir=None):
+    splits = frame_key.split('/')
+    if len(splits) == 2:
+        shot_id, frame_id, view_id = *splits, None
+    elif len(splits) == 3:
+        shot_id, frame_id, view_id = splits
+    else:
+        raise ValueError(f"Invalid frame_key format: {frame_key}")
+    
+    if view_id is None:
+        img_path = os.path.join(images_dir, video_name, shot_id, f"{frame_id}.jpg")
+    elif 'pshuman' in view_id:
+        img_path = os.path.join(pshuman_dir, video_name, shot_id, frame_id, f"color_{view_id.split('_')[-1]}.jpg")
+    else:
+        img_path = os.path.join(images_dir, video_name, shot_id, frame_id, f"{view_id:02}.jpg")
+        
+    if not os.path.exists(img_path):
+        return None
+    return load_image(img_path)
+
+
+def apply_matte_to_image(img_rgb, matte, background_color=1.0):
+    """Apply matte alpha mask to RGB image with white background.
+    
+    Args:
+        img_rgb: RGB image (H, W, 3) with values in [0, 255]
+        matte: Alpha mask (H, W) with values in [0, 1]
+        background_color: Background color (0-1 range), default white (1.0)
+    
+    Returns:
+        Matted RGB image (H, W, 3) with values in [0, 255]
+    """
+    img_float = img_rgb.astype(np.float32) / 255.0
+    matte_3ch = matte[:, :, None]  # (H, W, 1)
+    matted = img_float * matte_3ch + background_color * (1 - matte_3ch)
+    return (np.clip(matted, 0, 1) * 255).round().astype(np.uint8)
+
+
 class TrackBasePipeline:
     """
     Simplified tracking pipeline for processing frames without LMDB.
@@ -67,7 +119,8 @@ class TrackBasePipeline:
         R, T = cam2persp_cam_fov_body(wcam, tanfov=self.cfg.tanfov)
         return torch.cat((R, T[..., None]), axis=-1)
     
-    def track_base(self, img_rgb, no_body_crop=True, crop_scale=None):
+    def track_base(self, img_rgb, no_body_crop=True, crop_scale=None,
+                   skip_face=False, skip_hands=False):
         """
         Perform base tracking on a single frame.
         
@@ -134,12 +187,16 @@ class TrackBasePipeline:
         }
         
         # Check hand validity
-        base_results['left_hand_valid'] = (
-            base_results['dwpose_rlt']['scores'][-42:-21].mean() >= self.cfg.check_hand_score
-        )
-        base_results['right_hand_valid'] = (
-            base_results['dwpose_rlt']['scores'][-21:].mean() >= self.cfg.check_hand_score
-        )
+        if not skip_hands:
+            base_results['left_hand_valid'] = (
+                base_results['dwpose_rlt']['scores'][-42:-21].mean() >= self.cfg.check_hand_score
+            )
+            base_results['right_hand_valid'] = (
+                base_results['dwpose_rlt']['scores'][-21:].mean() >= self.cfg.check_hand_score
+            )
+        else:
+            base_results['left_hand_valid'] = False
+            base_results['right_hand_valid'] = False
         
         # Check if hands are crossing
         if ((base_results['dwpose_rlt']['keypoints'][-42:-21] - 
@@ -177,7 +234,7 @@ class TrackBasePipeline:
         lmk70 = self.lmk70_detector.run(t_img[None] / 255.)['pts'] * 2
         lmk_mp = self.mp_detector.run(crop_info['img_crop'])['pts']
         
-        if lmk203 is None or lmk_mp is None or lmk70 is None:
+        if skip_face or lmk203 is None or lmk_mp is None or lmk70 is None:
             base_results.update({
                 'head_lmk_203': np.zeros((203, 2)),
                 'head_lmk_70': np.zeros((70, 2)),

@@ -17,39 +17,8 @@ from PIL import Image as PILImage
 # Add src to path
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 
-from src.ehmx_track_base import TrackBasePipeline
+from src.ehmx_track_base import TrackBasePipeline, load_frame_image, load_matte, apply_matte_to_image
 from src.configs.data_prepare_config import DataPreparationConfig
-
-
-def load_image(image_path):
-    """Load image from disk as RGB numpy array."""
-    return np.array(PILImage.open(image_path).convert('RGB'))
-
-
-def load_matte(matte_path):
-    """Load single-channel matte image from disk as alpha mask."""
-    if not os.path.exists(matte_path):
-        return None
-    # Load as grayscale and normalize to [0, 1]
-    matte = np.array(PILImage.open(matte_path).convert('L')).astype(np.float32) / 255.0
-    return matte
-
-
-def apply_matte_to_image(img_rgb, matte, background_color=1.0):
-    """Apply matte alpha mask to RGB image with white background.
-    
-    Args:
-        img_rgb: RGB image (H, W, 3) with values in [0, 255]
-        matte: Alpha mask (H, W) with values in [0, 1]
-        background_color: Background color (0-1 range), default white (1.0)
-    
-    Returns:
-        Matted RGB image (H, W, 3) with values in [0, 255]
-    """
-    img_float = img_rgb.astype(np.float32) / 255.0
-    matte_3ch = matte[:, :, None]  # (H, W, 1)
-    matted = img_float * matte_3ch + background_color * (1 - matte_3ch)
-    return (np.clip(matted, 0, 1) * 255).round().astype(np.uint8)
 
 
 def process_video(video_name, video_data, args, pipeline):
@@ -86,15 +55,8 @@ def process_video(video_name, video_data, args, pipeline):
     valid_count = 0
     
     for frame_key in tqdm(frames_keys, desc=f"Processing {video_name}"):
-        # Construct image path
-        img_path = os.path.join(args.images_dir, video_name, f"{frame_key}.jpg")
-        
-        if not os.path.exists(img_path):
-            print(f"  Warning: Image not found: {img_path}")
-            continue
-        
-        # Load image
-        img_rgb = load_image(img_path)
+        # Load original image
+        img_rgb = load_frame_image(args.images_dir, video_name, frame_key, args.pshuman_dir)
         
         # Apply matte if available
         if args.mattes_dir:
@@ -104,7 +66,13 @@ def process_video(video_name, video_data, args, pipeline):
                 img_rgb = apply_matte_to_image(img_rgb, matte)
         
         # Process frame
-        ret_images, frame_base_results, mean_shape_results = pipeline.track_base(img_rgb)
+        skip_face = skip_hands = False
+        if 'pshuman' in frame_key:
+            skip_face = skip_hands = True
+
+        ret_images, frame_base_results, mean_shape_results = pipeline.track_base(
+            img_rgb, no_body_crop=True, skip_face=skip_face, skip_hands=skip_hands
+        )
         
         if ret_images is None or frame_base_results is None:
             print(f"  Warning: Failed to process frame: {frame_key}")
@@ -190,6 +158,8 @@ def main():
                         help='JSON file with frames to process')
     parser.add_argument('--mattes_dir', type=str, default=None,
                         help='Directory containing single-channel matte images (optional)')
+    parser.add_argument('--pshuman_dir', type=str, default=None,
+                        help='Root directory containing pshuman images')
     parser.add_argument('--ehmx_dir', type=str, required=True,
                         help='Directory for EHM-X tracking results')
     
@@ -234,12 +204,8 @@ def main():
                 if frame_key not in base_results:
                     continue
                 
-                img_path = os.path.join(args.images_dir, video_name, f"{frame_key}.jpg")
-                if not os.path.exists(img_path):
-                    continue
-                
                 # Load original image
-                img_rgb = load_image(img_path)
+                img_rgb = load_frame_image(args.images_dir, video_name, frame_key, args.pshuman_dir)
                 
                 # Reconstruct cropped body, face and hands using M_o2c from base_results
                 ret_images_dict[frame_key] = pipeline.reconstruct_cropped_images(
