@@ -162,6 +162,10 @@ def main():
                         help='Root directory containing pshuman images')
     parser.add_argument('--ehmx_dir', type=str, required=True,
                         help='Directory for EHM-X tracking results')
+    parser.add_argument('--check_hand_score', type=float, default=None,
+                        help='Overwrite config.check_hand_score if set')
+    parser.add_argument('--overwrite', action='store_true',
+                        help='Overwrite existing results')
     
     args = parser.parse_args()
     
@@ -175,6 +179,9 @@ def main():
     # Initialize pipeline
     print("\nInitializing TrackBasePipeline...")
     config = DataPreparationConfig()
+    if args.check_hand_score is not None:
+        config.check_hand_score = args.check_hand_score
+        print(f"Overwriting config.check_hand_score to {config.check_hand_score}")
     pipeline = TrackBasePipeline(config)
     
     # Process each video
@@ -184,12 +191,12 @@ def main():
         vis_path = os.path.join(video_out_dir, 'track_base.jpg')
         
         # Skip if both files exist
-        if os.path.exists(base_track_path) and os.path.exists(vis_path):
+        if not args.overwrite and os.path.exists(base_track_path) and os.path.exists(vis_path):
             print(f"\nSkipping {video_name}: both base_tracking.pkl and track_base.jpg exist")
             continue
         
         # If base_track exists but vis doesn't, generate vis from saved pkl
-        if os.path.exists(base_track_path) and not os.path.exists(vis_path):
+        if not args.overwrite and os.path.exists(base_track_path) and not os.path.exists(vis_path):
             print(f"\nGenerating visualization for {video_name} from existing base_tracking.pkl")
             
             # Load existing results
@@ -216,8 +223,12 @@ def main():
             generate_visualization(video_name, video_data, ret_images_dict, base_results, args.ehmx_dir, pipeline)
             continue
         
-        # Process video (base_track doesn't exist)
-        print(f"\nProcessing {video_name} (no existing base_tracking.pkl)")
+        # Process video (base_track doesn't exist or overwrite is True)
+        if args.overwrite:
+            print(f"\nProcessing {video_name} (overwrite enabled)")
+        else:
+            print(f"\nProcessing {video_name} (no existing base_tracking.pkl)")
+            
         base_results, id_share_params, ret_images_dict = process_video(
             video_name, video_data, args, pipeline
         )

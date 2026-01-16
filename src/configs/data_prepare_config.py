@@ -51,7 +51,9 @@ class DataPreparationConfig(PrintableConfig):
     max_frames: int = 75
     min_frames: int = 5
     
-    check_hand_score: float = 0.7
+    # check_hand_score=0.45 for training dataset
+    # check_hand_score=0.0 for testing video
+    check_hand_score: float = 0.45
     check_hand_dist:  float = body_hd_size*3
     not_check_hand: bool = False
     

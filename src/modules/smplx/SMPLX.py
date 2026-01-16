@@ -362,7 +362,7 @@ class SMPLX(nn.Module):
             shape_params = self.shape_params.expand(batch_size, -1)
         else:
             batch_size = shape_params.shape[0]
-        import ipdb ;ipdb.set_trace()
+#        import ipdb ;ipdb.set_trace()
         if proj_type == 'orth':
             projection_func = self.batch_orth_proj
         elif proj_type == 'persp' and param_dict['body_cam'].shape[-1] == 6:

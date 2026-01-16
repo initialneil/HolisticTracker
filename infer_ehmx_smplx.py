@@ -96,7 +96,7 @@ def load_body_images(video_name, frames_keys, base_results, images_dir, mattes_d
     return body_images
 
 
-def process_video_smplx(video_name, video_data, args, smplx_pipeline, cfg, optim_cfg):
+def process_video_smplx(video_name, video_data, args, smplx_pipeline, cfg, optim_cfgs):
     """
     Run SMPL-X refinement for a single video.
     
@@ -125,7 +125,7 @@ def process_video_smplx(video_name, video_data, args, smplx_pipeline, cfg, optim
     video_out_dir = os.path.join(args.ehmx_dir, video_name)
     track_flame_pkl_path = os.path.join(video_out_dir, 'track_flame.pkl')
     id_share_pkl_path = os.path.join(video_out_dir, 'id_share_params.pkl')
-    refined_pkl_path = os.path.join(video_out_dir, 'track_smplx.pkl')
+    refined_pkl_path = os.path.join(video_out_dir, 'optim_tracking_ehm.pkl')
     preview_path = os.path.join(video_out_dir, 'track_smplx.jpg')
     
     # Check if already processed
@@ -218,36 +218,44 @@ def process_video_smplx(video_name, video_data, args, smplx_pipeline, cfg, optim
     # Set saving root for smplx pipeline
     smplx_pipeline.saving_root = video_out_dir
     
-    print(f"  Running SMPL-X optimization...")
-    print(f"    Steps: {optim_cfg.steps}")
-    print(f"    Optimize camera: {optim_cfg.get('optim_camera', False)}")
+    print(f"  Running SMPL-X optimization ({len(optim_cfgs)} rounds)...")
+    
+    current_base_results = base_results
+    current_id_share_params = id_share_params
     
     try:
-        # Run SMPL-X refinement
-        opt_smplx_coeff, id_share_params = smplx_pipeline.run(
-            base_results,
-            id_share_params,
-            optim_cfg,
-            body_images,
-            frame_interval
-        )
+        for round_idx, optim_cfg in enumerate(optim_cfgs):
+            print(f"    Round {round_idx}: Steps={optim_cfg.steps}")
+            print(f"    Optimize camera: {optim_cfg.get('optim_camera', False)}")
+            
+            # Run SMPL-X refinement
+            opt_smplx_coeff, current_id_share_params = smplx_pipeline.run(
+                current_base_results,
+                current_id_share_params,
+                optim_cfg,
+                body_images,
+                frame_interval
+            )
+            
+            # Update current_base_results with refined coefficients for next round
+            for key in current_base_results.keys():
+                if key in opt_smplx_coeff:
+                    current_base_results[key]['smplx_coeffs'] = opt_smplx_coeff[key]
         
-        # Update results with refined SMPL-X coefficients
-        refined_results = {k: v.copy() for k, v in base_results.items()}
-        for key in refined_results.keys():
-            if key in opt_smplx_coeff:
-                refined_results[key]['smplx_coeffs'] = opt_smplx_coeff[key]
+        # Final results
+        refined_results = current_base_results
         
         # Save refined results
         print(f"  Saving refined results to: {refined_pkl_path}")
         write_dict_pkl(refined_pkl_path, refined_results)
         
         # Update and save id_share_params
-        write_dict_pkl(id_share_pkl_path, id_share_params)
+        write_dict_pkl(id_share_pkl_path, current_id_share_params)
         
         # Copy the final visualization to preview path
+        last_optim_cfg = optim_cfgs[-1]
         final_vis_path = os.path.join(video_out_dir, "visual_results", 
-                                     f"vis_fit_smplx_bid-0_stp-{optim_cfg.steps - 1}.png")
+                                     f"vis_fit_smplx_bid-0_stp-{last_optim_cfg.steps - 1}.png")
         if os.path.exists(final_vis_path):
             import shutil
             shutil.copy(final_vis_path, preview_path)
@@ -300,12 +308,29 @@ def main():
         return
     
     full_optim_config = OmegaConf.load(args.config)
-    optim_cfg = full_optim_config.optim_ehm
     
-    print(f"Optimization config loaded:")
-    print(f"  Steps: {optim_cfg.steps}")
-    print(f"  Share ID: {optim_cfg.share_id}")
-    print(f"  Optimize camera: {optim_cfg.get('optim_camera', False)}")
+    # Parse optimization rounds
+    optim_cfgs = []
+    if 'optim_ehm' in full_optim_config:
+        optim_cfgs.append(full_optim_config.optim_ehm)
+    else:
+        # Look for optim_ehm_round0, optim_ehm_round1, ...
+        round_idx = 0
+        while True:
+            round_key = f'optim_ehm_round{round_idx}'
+            if round_key in full_optim_config:
+                optim_cfgs.append(full_optim_config[round_key])
+                round_idx += 1
+            else:
+                break
+    
+    if not optim_cfgs:
+        print("Error: No optim_ehm or optim_ehm_roundX found in config")
+        return
+        
+    print(f"Optimization config loaded: {len(optim_cfgs)} rounds")
+    for i, cfg_round in enumerate(optim_cfgs):
+        print(f"  Round {i}: Steps={cfg_round.steps}, Share ID={cfg_round.share_id}")
     
     # Load data preparation config
     print(f"\nInitializing SMPL-X refinement pipeline...")
@@ -322,7 +347,7 @@ def main():
         
         try:
             refined_results, id_share_params = process_video_smplx(
-                video_name, video_data, args, smplx_pipeline, cfg, optim_cfg
+                video_name, video_data, args, smplx_pipeline, cfg, optim_cfgs
             )
             
             if refined_results is None:

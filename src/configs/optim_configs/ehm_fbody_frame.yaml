@@ -4,7 +4,7 @@ no_body_crop: false
 reset_to_base_track: true
 
 optim_flame:
-  steps: 501
+  steps: 201
   share_id: true
 
   # mini batch for video
@@ -21,8 +21,8 @@ optim_flame:
   # motion reg for video
   lambda_motion_reg: 10.0
 
-optim_ehm_round0:
-  steps: 301  # 1001
+optim_ehm:
+  steps: 201  # 1001
   share_id: true
 
   # mini batch for video
@@ -66,50 +66,6 @@ optim_ehm_round0:
   lambda_mtn_trans_z: 1.0
   lambda_mtn_vertices: 1.0
 
-optim_ehm_round1:
-  steps: 201  # 1001
-  share_id: true
-
-  # mini batch for video
-  mini_batch_size: 1024
-  share_pose: false
-
-  # optim
-  optim_camera: true
-
-  # Loss weights for EHM/SMPL-X optimization
-  lambda_3d_head: 1.0
-  lambda_3d_hand_l: 1.0
-  lambda_3d_hand_r: 1.0
-  lambda_3d_z: 0.1
-  lambda_2d_kpt: 1.0
-  lambda_2d_knee_feet: 10.0  # 10.0x of lambda_2d_kpt
-
-  lambda_prior: 1.0
-  lambda_smplx_shape_reg: 0.1
-  lambda_mano_shape_reg: 0.1
-  lambda_scale_reg: 100.0
-  lambda_joint_offset_reg: 1.0
-
-  # regularize change from init pose
-  lambda_smplx_pose: 1.0
-  lambda_smplx_init: 1.0  # Weight for regularizing invalid hands/face towards init pose
-
-  # invisible lower-body regularization
-  lambda_smplx_pose_reg_base: 1.0
-  lambda_smplx_leg_pose: 1.0
-  lambda_smplx_freezed_pose: 1.0
-
-  # hand
-  lambda_smplx_hand_pose_reg: 0.1
-
-  # temporal motion
-  lambda_mtn_body_pose: 200.0
-  lambda_mtn_hand_pose: 200.0
-  lambda_mtn_rot6d: 100.0
-  lambda_mtn_trans: 100.0
-  lambda_mtn_trans_z: 100.0
-  lambda_mtn_vertices: 20.0
 
 # After reseating the processor and heatsink, the system boots successfully into Windows.
 
