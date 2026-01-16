@@ -29,7 +29,8 @@ def load_matte(matte_path):
     return matte
 
 
-def load_frame_image(images_dir, video_name, frame_key, pshuman_dir=None):
+def split_frame_key(frame_key):
+    """Split frame key into shot_id, frame_id, and optional view_id."""
     splits = frame_key.split('/')
     if len(splits) == 2:
         shot_id, frame_id, view_id = *splits, None
@@ -37,6 +38,11 @@ def load_frame_image(images_dir, video_name, frame_key, pshuman_dir=None):
         shot_id, frame_id, view_id = splits
     else:
         raise ValueError(f"Invalid frame_key format: {frame_key}")
+    return shot_id, frame_id, view_id
+
+
+def load_frame_image(images_dir, video_name, frame_key, pshuman_dir=None):
+    shot_id, frame_id, view_id = split_frame_key(frame_key)
     
     if view_id is None:
         img_path = os.path.join(images_dir, video_name, shot_id, f"{frame_id}.jpg")
@@ -47,7 +53,12 @@ def load_frame_image(images_dir, video_name, frame_key, pshuman_dir=None):
         
     if not os.path.exists(img_path):
         return None
-    return load_image(img_path)
+        
+    img = load_image(img_path)
+    if view_id is not None and 'pshuman' in view_id:
+        if '03' in view_id:
+            img = cv2.flip(img, 1)  # Horizontal flip for left view
+    return img
 
 
 def apply_matte_to_image(img_rgb, matte, background_color=1.0):
@@ -188,12 +199,14 @@ class TrackBasePipeline:
         
         # Check hand validity
         if not skip_hands:
-            base_results['left_hand_valid'] = (
-                base_results['dwpose_rlt']['scores'][-42:-21].mean() >= self.cfg.check_hand_score
-            )
-            base_results['right_hand_valid'] = (
-                base_results['dwpose_rlt']['scores'][-21:].mean() >= self.cfg.check_hand_score
-            )
+            if base_results['dwpose_rlt']['scores'][-42:-21].mean() >= self.cfg.check_hand_score:
+                base_results['left_hand_valid'] = True
+            else:
+                base_results['left_hand_valid'] = False
+            if base_results['dwpose_rlt']['scores'][-21:].mean() >= self.cfg.check_hand_score:
+                base_results['right_hand_valid'] = True
+            else:
+                base_results['right_hand_valid'] = False
         else:
             base_results['left_hand_valid'] = False
             base_results['right_hand_valid'] = False

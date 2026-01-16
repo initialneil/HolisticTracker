@@ -15,7 +15,10 @@ class ArgumentConfig(PrintableConfig):
     tracking_with_interval : bool =False
     save_images: bool = False
     save_visual_render: bool = False
-    check_hand_score: float = 0.7
+
+    # check_hand_score=0.45 for training dataset
+    # check_hand_score=0.0 for testing video
+    check_hand_score: float = 0.45
     not_check_hand: bool = False
     
     optim_cfg: str = 'src/configs/optim_configs/ehm_ubody.yaml'  # path to optimization config file

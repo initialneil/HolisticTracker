@@ -255,11 +255,6 @@ def extract_shot_frames(video_path, shot_key, start_frame, end_frame, shots_fps,
         Number of frames extracted
     """
     
-    # Convert frame keys to timestamps
-    start_time = frame_key_to_timestamp(start_frame, extract_fps)
-    end_time = frame_key_to_timestamp(end_frame, extract_fps)
-    duration = end_time - start_time
-    
     # Create output directory
     shot_output_dir = output_dir / shot_key
     shot_output_dir.mkdir(parents=True, exist_ok=True)
@@ -280,6 +275,11 @@ def extract_shot_frames(video_path, shot_key, start_frame, end_frame, shots_fps,
     else:
         target_fps = extract_fps
         frame_interval = max(1, int(video_fps_actual / target_fps))
+    
+    # Convert frame keys to timestamps
+    start_time = frame_key_to_timestamp(start_frame, target_fps)
+    end_time = frame_key_to_timestamp(end_frame, target_fps)
+    duration = end_time - start_time
     
     # Calculate start and end frame numbers in video
     start_frame_num = int(start_time * video_fps_actual)
@@ -347,7 +347,7 @@ def extract_shot_frames(video_path, shot_key, start_frame, end_frame, shots_fps,
     return len(extracted_frames)
 
 
-def process_video(video_name, videos_dir, shots_dir, images_dir, shots_fps, extract_fps, crop_shot_bbox=None):
+def process_video(video_name, videos_dir, shots_dir, images_dir, shots_fps, extract_fps, crop_shot_bbox=None, max_shots=None, anno_dir=None, index_shots_filter=None):
     """
     Process one video and extract frames for all shots.
     
@@ -359,6 +359,9 @@ def process_video(video_name, videos_dir, shots_dir, images_dir, shots_fps, extr
         shots_fps: FPS used when extracting keyframes
         extract_fps: Target FPS for extraction
         crop_shot_bbox: Target size for cropping and resizing (e.g., 1024), None to disable
+        max_shots: Maximum number of shots to extract (default: None = all)
+        anno_dir: Directory containing annotation JSON files (optional)
+        index_shots_filter: Set of shot keys (effective frame numbers) to include (optional)
     
     Returns:
         Number of shots processed
@@ -432,6 +435,20 @@ def process_video(video_name, videos_dir, shots_dir, images_dir, shots_fps, extr
     
     # Get frames_keys with bbox info from the original shot JSON
     original_frames_keys = video_data.get('frames_keys', {})
+
+    # Load wrong annotations if anno_dir is provided
+    wrong_frames = set()
+    if anno_dir is not None:
+        anno_file = Path(anno_dir) / f"{video_name}.json"
+        if anno_file.exists():
+            try:
+                with open(anno_file, 'r') as f:
+                    anno_data = json.load(f)
+                wrong_frames = set(anno_data.get('wrong', []))
+                if len(wrong_frames) > 0:
+                    print(f"Loaded {len(wrong_frames)} wrong frames from annotation")
+            except Exception as e:
+                print(f"Error loading annotation: {e}")
     
     for shot_key in shot_keys:
         # Parse shot_key to get start and end frame
@@ -446,6 +463,33 @@ def process_video(video_name, videos_dir, shots_dir, images_dir, shots_fps, extr
         if start_frame == end_frame:
             print(f"  Skipping single-frame shot: {shot_key}")
             continue
+        
+        # Convert shot_key to effective frame numbers for filtering
+        if effective_extract_fps is not None and effective_extract_fps != shots_fps:
+            effective_shot_key = convert_shot_key(shot_key, shots_fps, effective_extract_fps)
+        else:
+            effective_shot_key = shot_key
+        
+        # Filter by index_shots if provided
+        if index_shots_filter is not None and effective_shot_key not in index_shots_filter:
+            continue
+
+        # Filter by annotation: if a wrong frame exists in the shot, skip the shot
+        if len(wrong_frames) > 0:
+            shot_start = int(parts[0])
+            shot_end = int(parts[1])
+            shot_has_wrong_frame = False
+            
+            for orig_frame_key in original_frames_keys:
+                orig_frame_num = int(orig_frame_key)
+                if shot_start <= orig_frame_num <= shot_end:
+                    if orig_frame_key in wrong_frames:
+                        shot_has_wrong_frame = True
+                        break
+            
+            if shot_has_wrong_frame:
+                # print(f"  Skipping shot {shot_key} due to wrong annotation")
+                continue
         
         # Convert shot_key to extract_fps frame numbers
         if effective_extract_fps is not None and effective_extract_fps != shots_fps:
@@ -510,6 +554,10 @@ def process_video(video_name, videos_dir, shots_dir, images_dir, shots_fps, extr
             
             shots_processed += 1
             total_frames += num_frames
+
+            if max_shots is not None and shots_processed >= max_shots:
+                print(f"  Reached max_shots ({max_shots}), stopping.")
+                break
         else:
             print(f"  Warning: No frames extracted for {shot_key}")
     
@@ -536,8 +584,8 @@ def main():
     parser = argparse.ArgumentParser(description='Extract frames from video shots')
     parser.add_argument('--videos_json', type=str, required=True,
                         help='Path to videos_info.json containing train/test split')
-    parser.add_argument('--split', type=str, required=True, choices=['train', 'test'],
-                        help='Split to process (train or test)')
+    parser.add_argument('--split', type=str, required=True,
+                        help='Split to process (train, test, or valid)')
     parser.add_argument('--videos_dir', type=str, required=True,
                         help='Directory containing source MP4 videos')
     parser.add_argument('--shots_dir', type=str, required=True,
@@ -550,6 +598,12 @@ def main():
                         help='Output directory for extracted images')
     parser.add_argument('--crop_shot_bbox', type=int, default=1024,
                         help='Target size for cropping and resizing frames (default: 1024). Set to 0 to disable cropping.')
+    parser.add_argument('--max_shots', type=int, default=None,
+                        help='Maximum number of shots to extract per video (default: None = all)')
+    parser.add_argument('--anno_dir', type=str, default=None,
+                        help='Directory containing annotation JSON files (optional). If provided, shots with wrong frames will be skipped.')
+    parser.add_argument('--index_shots', type=str, default=None,
+                        help='Path to JSON file containing video names and their shot lists to extract. Format: {"video_name": ["shot1", "shot2", ...]}. Shot names are in effective frame numbers.')
     
     args = parser.parse_args()
     
@@ -578,8 +632,23 @@ def main():
     
     images_dir.mkdir(parents=True, exist_ok=True)
     
+    # Load index_shots if provided
+    index_shots_dict = None
+    if args.index_shots is not None:
+        index_shots_path = Path(args.index_shots)
+        if not index_shots_path.exists():
+            raise ValueError(f"Index shots JSON not found: {index_shots_path}")
+        with open(index_shots_path, 'r', encoding='utf-8') as f:
+            index_shots_dict = json.load(f)
+        print(f"Loaded index shots from {index_shots_path}: {len(index_shots_dict)} videos")
+    
     # Load video list
     videos_list = load_videos_list(videos_json, args.split)
+    
+    # Filter by index_shots if provided
+    if index_shots_dict is not None:
+        videos_list = [v for v in videos_list if v in index_shots_dict]
+        print(f"Filtered to {len(videos_list)} videos based on index_shots")
     
     if len(videos_list) == 0:
         raise ValueError(f"No videos found for split '{args.split}' in {videos_json}")
@@ -588,14 +657,21 @@ def main():
     print(f"Shots FPS: {args.shots_fps}")
     print(f"Extract FPS: {args.extract_fps if args.extract_fps is not None else 'original video FPS'}")
     print(f"Crop and resize: {'Enabled (' + str(args.crop_shot_bbox) + 'x' + str(args.crop_shot_bbox) + ')' if args.crop_shot_bbox > 0 else 'Disabled'}")
+    if args.max_shots is not None:
+        print(f"Max shots per video: {args.max_shots}")
     
     # Process each video
     total_shots = 0
     crop_size = args.crop_shot_bbox if args.crop_shot_bbox > 0 else None
     for video_name in videos_list:
+        # Get shot filter for this video if index_shots is provided
+        index_shots_filter = None
+        if index_shots_dict is not None and video_name in index_shots_dict:
+            index_shots_filter = set(index_shots_dict[video_name])
+        
         num_shots = process_video(
             video_name, videos_dir, shots_dir, images_dir,
-            args.shots_fps, args.extract_fps, crop_size
+            args.shots_fps, args.extract_fps, crop_size, args.max_shots, args.anno_dir, index_shots_filter
         )
         total_shots += num_shots
     

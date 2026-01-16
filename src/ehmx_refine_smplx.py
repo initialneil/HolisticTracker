@@ -22,6 +22,7 @@ from .utils.draw import draw_landmarks
 from .utils import rotation_converter as converter
 from .losses import Landmark2DLoss, PoseLoss
 from .modules.refiner.smplx_utils import smplx_joints_to_dwpose, smplx_to_dwpose
+from .ehmx_track_base import split_frame_key
 
 np.random.seed(0)
 
@@ -104,6 +105,243 @@ def group_frames_by_shots(frame_keys):
     
     # Return as list of lists
     return list(shot_groups.values())
+
+
+def make_pshuman_camera(original_RT, view_id, device='cuda'):
+    """
+    Calculate PSHuman camera RT parameters from original camera.
+    
+    Args:
+        original_RT: Original camera RT parameters (3x4 or 4x4)
+        view_id: PSHuman view identifier (e.g., 'pshuman_02', 'pshuman_03')
+        device: Device for tensor operations
+    
+    Returns:
+        Transformed camera RT parameters for PSHuman view
+    """
+    # Convert PyTorch 3D coordinate system to COLMAP coordinate system
+    c2c_mat = torch.tensor([[-1, 0, 0, 0],
+                            [ 0,-1, 0, 0],
+                            [ 0, 0, 1, 0],
+                            [ 0, 0, 0, 1]],
+                           dtype=torch.float32, device=device)
+    
+    RT_mat = torch.eye(4, dtype=torch.float32, device=device)
+    if original_RT.shape[0] == 3:
+        RT_mat[:3, :4] = original_RT
+    else:
+        RT_mat = original_RT
+    
+    w2c_cam = torch.matmul(c2c_mat, RT_mat)
+    c2w_cam = torch.linalg.inv(w2c_cam)
+    
+    # Apply view-specific transformation
+    if 'color_02' in view_id or 'pshuman_02' in view_id:
+        # Mode 4: -90° Y-rotation for left side view
+        rot_y_neg90 = torch.tensor([
+            [0, 0, -1, 0],
+            [0, 1, 0, 0],
+            [1, 0, 0, 0],
+            [0, 0, 0, 1]
+        ], dtype=torch.float32, device=device)
+        c2w_pshuman = torch.matmul(rot_y_neg90, c2w_cam)
+    
+    elif 'color_03' in view_id or 'pshuman_03' in view_id:
+        """
+        # 1. If color_03 of pshuman is directly loaded without flipping:
+        # Solution A1 and A2 are equivalent.
+
+        # [Solution A1]
+        # It's contour-aligned back view w.r.t. the original front view.
+        rot_y_180 = torch.tensor([
+            [-1, 0, 0, 0],
+            [0, 1, 0, 0],
+            [0, 0, -1, 0],
+            [0, 0, 0, 1]
+        ], dtype=torch.float32, device=device)
+        mirror_x = torch.tensor([
+            [-1, 0, 0, 0],
+            [0, 1, 0, 0],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1]
+        ], dtype=torch.float32, device=device)
+        c2w_pshuman = torch.matmul(mirror_x, torch.matmul(rot_y_180, c2w_cam))
+
+        [Solution A2]
+        # Simple Z-axis flip for back view (if didn't flip while loading)
+        flip_z = torch.tensor([
+            [1, 0, 0, 0],
+            [0, 1, 0, 0],
+            [0, 0, -1, 0],
+            [0, 0, 0, 1]
+        ], dtype=torch.float32, device=device)
+        c2w_pshuman = torch.matmul(flip_z, torch.matmul(c2w_cam, mirror_x))
+    
+        # 2. If color_03 of pshuman is horizontally flipped to correct left/right:
+        # Apply mirror_x on image coordinate system first, then do Z-flip.
+        mirror_x = torch.tensor([
+            [-1, 0, 0, 0],
+            [0, 1, 0, 0],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1]
+        ], dtype=torch.float32, device=device)
+
+        flip_z = torch.tensor([
+            [1, 0, 0, 0],
+            [0, 1, 0, 0],
+            [0, 0, -1, 0],
+            [0, 0, 0, 1]
+        ], dtype=torch.float32, device=device)
+        c2w_pshuman = torch.matmul(flip_z, torch.matmul(c2w_cam, mirror_x))
+        """
+        # mirror_x applied first for horizontal flip
+        mirror_x = torch.tensor([
+            [-1, 0, 0, 0],
+            [0, 1, 0, 0],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1]
+        ], dtype=torch.float32, device=device)
+
+        # Z-axis flip for back view (if didn't flip while loading)
+        flip_z = torch.tensor([
+            [1, 0, 0, 0],
+            [0, 1, 0, 0],
+            [0, 0, -1, 0],
+            [0, 0, 0, 1]
+        ], dtype=torch.float32, device=device)
+        c2w_pshuman = torch.matmul(flip_z, torch.matmul(c2w_cam, mirror_x))
+    
+    else:
+        # Unknown view, return original
+        c2w_pshuman = c2w_cam
+    
+    # Convert back to PyTorch 3D coordinate system
+    w2c_pshuman = torch.linalg.inv(c2w_pshuman)
+    RT_pshuman_mat = torch.matmul(torch.linalg.inv(c2c_mat), w2c_pshuman)
+    
+    return RT_pshuman_mat[:3, :4]
+
+
+def group_frames_by_pose(frame_keys):
+    """
+    Group frame indices by pose (same frame_id shares same pose).
+    
+    Args:
+        frame_keys: List of frame keys (may include view_ids)
+    
+    Returns:
+        Dictionary mapping frame_id to list of indices that share that pose
+    """
+    pose_groups = {}
+    for idx, frame_key in enumerate(frame_keys):
+        shot_id, frame_id, view_id = split_frame_key(frame_key)
+        pose_key = f"{shot_id}/{frame_id}"
+        if pose_key not in pose_groups:
+            pose_groups[pose_key] = []
+        pose_groups[pose_key].append(idx)
+    
+    return pose_groups
+
+
+def group_frames_by_camera(frame_keys):
+    """
+    Group frame indices by camera key.
+    
+    Camera key rules:
+    1. <shot_id>/<frame_id> => camera_key: <shot_id>/<frame_id>
+    2. <shot_id>/<frame_id>/<normal view_id> => camera_key: <shot_id>/<view_id>
+    3. <shot_id>/<frame_id>/<pshuman view_id> => derived from camera at <shot_id>/<frame_id>
+    
+    Args:
+        frame_keys: List of frame keys (may include view_ids)
+    
+    Returns:
+        Dictionary mapping camera_key to (list of indices, is_pshuman, source_camera_key)
+    """
+    camera_groups = {}
+    for idx, frame_key in enumerate(frame_keys):
+        shot_id, frame_id, view_id = split_frame_key(frame_key)
+        
+        if view_id is None:
+            # Original frame: camera_key = shot_id/frame_id
+            camera_key = f"{shot_id}/{frame_id}"
+            is_pshuman = False
+            source_camera_key = None
+        elif 'pshuman' in view_id or 'color' in view_id:
+            # PSHuman view: derived from shot_id/frame_id
+            camera_key = f"{shot_id}/{frame_id}/{view_id}"
+            is_pshuman = True
+            source_camera_key = f"{shot_id}/{frame_id}"
+        else:
+            # Normal multi-view: camera_key = shot_id/view_id
+            camera_key = f"{shot_id}/{view_id}"
+            is_pshuman = False
+            source_camera_key = None
+        
+        if camera_key not in camera_groups:
+            camera_groups[camera_key] = ([], is_pshuman, source_camera_key)
+        camera_groups[camera_key][0].append(idx)
+    
+    return camera_groups
+
+
+def make_camera_R6d_T(unique_gl_T, unique_gl_R_6d, batch_to_camera_idx, unique_cameras, camera_to_idx, camera_is_pshuman, camera_source_key, batch_size, device='cuda'):
+    """
+    Expand camera parameters for batch based on camera types.
+    For regular cameras, uses optimized parameters directly.
+    For PSHuman cameras, derives from source camera using transformation.
+    
+    Args:
+        unique_gl_T: Optimized translation parameters for unique cameras
+        unique_gl_R_6d: Optimized 6D rotation parameters for unique cameras
+        batch_to_camera_idx: Tensor mapping batch indices to camera indices
+        unique_cameras: List of unique camera keys
+        camera_to_idx: Mapping from camera_key to camera index
+        camera_is_pshuman: Dict mapping camera_key to boolean (is PSHuman?)
+        camera_source_key: Dict mapping camera_key to source camera_key (for PSHuman)
+        batch_size: Number of frames in batch
+        device: Device for tensor operations
+    
+    Returns:
+        Tuple of (gl_T, gl_R_6d) tensors expanded to batch size
+    """
+    gl_T_list = []
+    gl_R_6d_list = []
+    
+    for batch_idx in range(batch_size):
+        camera_idx = batch_to_camera_idx[batch_idx].item()
+        camera_key = unique_cameras[camera_idx]
+        
+        if camera_is_pshuman[camera_key]:
+            # PSHuman camera: derive from source camera
+            source_key = camera_source_key[camera_key]
+            if source_key in camera_to_idx:
+                source_camera_idx = camera_to_idx[source_key]
+                
+                # Build source camera RT from optimized params
+                source_RT = torch.eye(4, device=device, dtype=torch.float32)
+                source_RT[:3, 3] = unique_gl_T[source_camera_idx]
+                source_RT[:3, :3] = rotation_6d_to_matrix(unique_gl_R_6d[source_camera_idx])
+                
+                # Extract view_id from camera_key (format: shot_id/frame_id/view_id)
+                view_id = camera_key.split('/')[-1]
+                
+                # Calculate PSHuman camera
+                pshuman_RT = make_pshuman_camera(source_RT[:3, :4], view_id, device)
+                
+                # Extract T and R_6d
+                gl_T_list.append(pshuman_RT[:3, 3])
+                gl_R_6d_list.append(matrix_to_rotation_6d(pshuman_RT[:3, :3]))
+            else:
+                # Fallback: use camera params directly
+                gl_T_list.append(unique_gl_T[camera_idx])
+                gl_R_6d_list.append(unique_gl_R_6d[camera_idx])
+        else:
+            # Regular camera: use optimized parameters directly
+            gl_T_list.append(unique_gl_T[camera_idx])
+            gl_R_6d_list.append(unique_gl_R_6d[camera_idx])
+    
+    return torch.stack(gl_T_list, dim=0), torch.stack(gl_R_6d_list, dim=0)
 
 
 class RefineSmplxPipeline(object):
@@ -313,6 +551,7 @@ class RefineSmplxPipeline(object):
         lambda_scale_reg = optim_cfg.get('lambda_scale_reg', 100.0)
         lambda_joint_offset_reg = optim_cfg.get('lambda_joint_offset_reg', 1.0)
         lambda_mtn_body_pose = optim_cfg.get('lambda_mtn_body_pose', 200.0)
+        lambda_mtn_hand_pose = optim_cfg.get('lambda_mtn_hand_pose', 0.0)
         lambda_mtn_rot6d = optim_cfg.get('lambda_mtn_rot6d', 100.0)
         lambda_mtn_trans = optim_cfg.get('lambda_mtn_trans', 100.0)
         lambda_mtn_trans_z = optim_cfg.get('lambda_mtn_trans_z', 100.0)
@@ -372,6 +611,100 @@ class RefineSmplxPipeline(object):
         left_hand_pose = batch_smplx['left_hand_pose']
         right_hand_pose = batch_smplx['right_hand_pose']
         
+        # Multi-view support: Group frames by pose and camera
+        pose_groups = group_frames_by_pose(track_frames)
+        camera_groups = group_frames_by_camera(track_frames)
+        
+        # Create pose indices mapping: each unique pose gets an index
+        unique_poses = sorted(pose_groups.keys())
+        pose_to_idx = {pose_key: idx for idx, pose_key in enumerate(unique_poses)}
+        n_unique_poses = len(unique_poses)
+        
+        # Create camera indices mapping: each unique camera gets an index
+        unique_cameras = sorted(camera_groups.keys())
+        camera_to_idx = {cam_key: idx for idx, cam_key in enumerate(unique_cameras)}
+        n_unique_cameras = len(unique_cameras)
+        
+        # Extract camera metadata
+        camera_is_pshuman = {cam_key: camera_groups[cam_key][1] for cam_key in unique_cameras}
+        camera_source_key = {cam_key: camera_groups[cam_key][2] for cam_key in unique_cameras}
+        
+        # Build mapping from batch index to pose/camera indices
+        batch_to_pose_idx = torch.zeros(batch_size, dtype=torch.long, device=self.device)
+        batch_to_camera_idx = torch.zeros(batch_size, dtype=torch.long, device=self.device)
+        
+        for batch_idx, frame_key in enumerate(track_frames):
+            shot_id, frame_id, view_id = split_frame_key(frame_key)
+            pose_key = f"{shot_id}/{frame_id}"
+            
+            # Determine camera key using same logic as group_frames_by_camera
+            if view_id is None:
+                camera_key = f"{shot_id}/{frame_id}"
+            elif 'pshuman' in view_id or 'color' in view_id:
+                camera_key = f"{shot_id}/{frame_id}/{view_id}"
+            else:
+                camera_key = f"{shot_id}/{view_id}"
+            
+            batch_to_pose_idx[batch_idx] = pose_to_idx[pose_key]
+            batch_to_camera_idx[batch_idx] = camera_to_idx[camera_key]
+        
+        # Initialize unique pose parameters
+        if not share_pose:
+            # Create unique pose tensors (one per unique frame_id)
+            unique_body_pose = torch.zeros(n_unique_poses, body_pose.shape[1], 3, 
+                                          dtype=torch.float32, device=self.device)
+            unique_global_pose = torch.zeros(n_unique_poses, global_pose.shape[1],
+                                            dtype=torch.float32, device=self.device)
+            unique_left_hand_pose = torch.zeros(n_unique_poses, left_hand_pose.shape[1], 3,
+                                               dtype=torch.float32, device=self.device)
+            unique_right_hand_pose = torch.zeros(n_unique_poses, right_hand_pose.shape[1], 3,
+                                                dtype=torch.float32, device=self.device)
+            
+            # Initialize from first occurrence of each pose
+            for pose_key, batch_indices in pose_groups.items():
+                pose_idx = pose_to_idx[pose_key]
+                first_batch_idx = batch_indices[0]
+                unique_body_pose[pose_idx] = body_pose[first_batch_idx].view(-1, 3).float()
+                unique_global_pose[pose_idx] = global_pose[first_batch_idx].float()
+                unique_left_hand_pose[pose_idx] = left_hand_pose[first_batch_idx].view(-1, 3).float()
+                unique_right_hand_pose[pose_idx] = right_hand_pose[first_batch_idx].view(-1, 3).float()
+            
+            # Expand to batch size using mapping
+            body_pose = unique_body_pose[batch_to_pose_idx]
+            global_pose = unique_global_pose[batch_to_pose_idx]
+            left_hand_pose = unique_left_hand_pose[batch_to_pose_idx]
+            right_hand_pose = unique_right_hand_pose[batch_to_pose_idx]
+        
+        # Initialize unique camera parameters
+        unique_camera_RT = torch.zeros(n_unique_cameras, 3, 4, dtype=torch.float32, device=self.device)
+        
+        # Initialize from first occurrence of each camera
+        for camera_key in unique_cameras:
+            batch_indices, is_pshuman, source_camera_key = camera_groups[camera_key]
+            camera_idx = camera_to_idx[camera_key]
+            first_batch_idx = batch_indices[0]
+            
+            if is_pshuman:
+                # PSHuman camera: derive from source camera
+                if source_camera_key in camera_to_idx:
+                    # Get source camera index
+                    source_batch_indices = camera_groups[source_camera_key][0]
+                    source_batch_idx = source_batch_indices[0]
+                    source_RT = camera_RT_params[source_batch_idx]
+                    
+                    # Extract view_id for transformation
+                    _, _, view_id = split_frame_key(track_frames[first_batch_idx])
+                    unique_camera_RT[camera_idx] = make_pshuman_camera(source_RT, view_id, self.device)
+                else:
+                    # Fallback: use current frame's RT
+                    unique_camera_RT[camera_idx] = camera_RT_params[first_batch_idx]
+            else:
+                # Regular camera: use RT from first occurrence
+                unique_camera_RT[camera_idx] = camera_RT_params[first_batch_idx]
+        
+        # Expand cameras to batch size using mapping
+        camera_RT_params = unique_camera_RT[batch_to_camera_idx]
+        
         if share_pose:
             body_pose = body_pose.mean(dim=0, keepdim=True).float()
             global_pose = global_pose.mean(dim=0, keepdim=True).float()
@@ -404,25 +737,33 @@ class RefineSmplxPipeline(object):
             batch_base['body_crop']
         )
         
-        # Validate hand tracking
-        left_wrist_kpt2d = gt_lmk_2d['keypoints'][:, 7, :2]
-        left_elbow_kpt2d = gt_lmk_2d['keypoints'][:, 6, :2]
-        right_wrist_kpt2d = gt_lmk_2d['keypoints'][:, 4, :2]
-        right_elbow_kpt2d = gt_lmk_2d['keypoints'][:, 3, :2]
+        # # Validate hand tracking
+        # left_wrist_kpt2d = gt_lmk_2d['keypoints'][:, 7, :2]
+        # left_elbow_kpt2d = gt_lmk_2d['keypoints'][:, 6, :2]
+        # right_wrist_kpt2d = gt_lmk_2d['keypoints'][:, 4, :2]
+        # right_elbow_kpt2d = gt_lmk_2d['keypoints'][:, 3, :2]
         
-        left_wrist_elbow_dist = torch.norm(left_wrist_kpt2d - left_elbow_kpt2d, dim=1)
-        right_wrist_elbow_dist = torch.norm(right_wrist_kpt2d - right_elbow_kpt2d, dim=1)
+        # left_wrist_elbow_dist = torch.norm(left_wrist_kpt2d - left_elbow_kpt2d, dim=1)
+        # right_wrist_elbow_dist = torch.norm(right_wrist_kpt2d - right_elbow_kpt2d, dim=1)
         
-        if left_hand_valid.sum() > 0:
-            left_hand_wrist_3d = ref_hand_l_vertices[:, self.ehm.mano.selected_vert_ids].mean(dim=1)[:, :2]
-            left_hand_wrist_dist = torch.norm(left_hand_wrist_3d - left_wrist_kpt2d, dim=1)
-            left_hand_valid = left_hand_valid & (left_hand_wrist_dist < left_wrist_elbow_dist)
+        # if left_hand_valid.sum() > 0:
+        #     left_hand_wrist_3d = ref_hand_l_vertices[:, self.ehm.mano.selected_vert_ids].mean(dim=1)[:, :2]
+        #     left_hand_wrist_dist = torch.norm(left_hand_wrist_3d - left_wrist_kpt2d, dim=1)
+        #     left_hand_valid = left_hand_valid & (left_hand_wrist_dist < left_wrist_elbow_dist)
         
-        if right_hand_valid.sum() > 0:
-            right_hand_wrist_3d = ref_hand_r_vertices[:, self.ehm.mano.selected_vert_ids].mean(dim=1)[:, :2]
-            right_hand_wrist_dist = torch.norm(right_hand_wrist_3d - right_wrist_kpt2d, dim=1)
-            right_hand_valid = right_hand_valid & (right_hand_wrist_dist < right_wrist_elbow_dist)
+        # if right_hand_valid.sum() > 0:
+        #     right_hand_wrist_3d = ref_hand_r_vertices[:, self.ehm.mano.selected_vert_ids].mean(dim=1)[:, :2]
+        #     right_hand_wrist_dist = torch.norm(right_hand_wrist_3d - right_wrist_kpt2d, dim=1)
+        #     right_hand_valid = right_hand_valid & (right_hand_wrist_dist < right_wrist_elbow_dist)
         
+        # Identify pshuman frames for motion regularization anchoring
+        is_pshuman_list = []
+        for frame_key in track_frames:
+            _, _, view_id = split_frame_key(frame_key)
+            is_pshuman = (view_id is not None and 'pshuman' in view_id)
+            is_pshuman_list.append(is_pshuman)
+        is_pshuman_tensor = torch.tensor(is_pshuman_list, device=self.device).bool()
+
         # Learning rate decay for multi-batch
         _lr_decay = 1.0
         if batch_id > 0:
@@ -445,22 +786,35 @@ class RefineSmplxPipeline(object):
         g_smplx_shape.requires_grad = True
         left_hand_shape.requires_grad = True
         right_hand_shape.requires_grad = True
-        body_pose.requires_grad = True
-        left_hand_pose.requires_grad = True
-        right_hand_pose.requires_grad = True
         
-        gl_T = camera_RT_params[:, :3, 3].detach().clone()
-        gl_R = camera_RT_params[:, :3, :3].detach().clone()
-        gl_R_6d = matrix_to_rotation_6d(gl_R).detach().clone()
+        # For multi-view: optimize unique poses
+        if not share_pose:
+            unique_body_pose.requires_grad = True
+            unique_left_hand_pose.requires_grad = True
+            unique_right_hand_pose.requires_grad = True
+            unique_global_pose.requires_grad = True
+        else:
+            body_pose.requires_grad = True
+            left_hand_pose.requires_grad = True
+            right_hand_pose.requires_grad = True
+        
+        # For multi-view: optimize unique cameras
+        unique_gl_T = unique_camera_RT[:, :3, 3].detach().clone()
+        unique_gl_R_6d = matrix_to_rotation_6d(unique_camera_RT[:, :3, :3]).detach().clone()
         
         _lr_camera = 0.0
         if optim_camera:
-            gl_T[:, 2] = (gl_T[:, 2].mean(dim=0)[None].expand(batch_size, -1).detach().clone())[:, 0]
+            # For original cameras, can align Z
+            for cam_idx, view_key in enumerate(unique_cameras):
+                if view_key == "original":
+                    # Align Z across all original cameras
+                    orig_indices = [i for i, k in enumerate(unique_cameras) if k == "original"]
+                    if len(orig_indices) > 0:
+                        unique_gl_T[orig_indices, 2] = unique_gl_T[orig_indices, 2].mean()
             _lr_camera = 1.0
         
-        gl_T.requires_grad = True
-        gl_R.requires_grad = True
-        gl_R_6d.requires_grad = True
+        unique_gl_T.requires_grad = True
+        unique_gl_R_6d.requires_grad = True
         joints_offset.requires_grad = True
         g_flame_shape.requires_grad = True
         head_scale.requires_grad = True
@@ -470,22 +824,34 @@ class RefineSmplxPipeline(object):
         leg_body_joints = [4, 5, 7, 8, 10]
         freezed_body_joints = [1, 3, 2, 6, 9]
         
-        # Setup optimizer
-        opt_p = torch.optim.AdamW([
-            {'params': [body_pose], 'lr': 1e-3},
+        # Setup optimizer - handle multi-view parameters
+        opt_params = [
             {'params': [g_smplx_shape], 'lr': 1e-4 * _lr_decay},
             {'params': [left_hand_shape], 'lr': 1e-4 * _lr_decay},
             {'params': [right_hand_shape], 'lr': 1e-4 * _lr_decay},
-            {'params': [right_hand_pose], 'lr': 1e-5},
-            {'params': [left_hand_pose], 'lr': 1e-5},
-            {'params': [gl_T], 'lr': 5e-3 * _lr_camera},
-            {'params': [gl_R], 'lr': 5e-4 * _lr_camera},
-            {'params': [gl_R_6d], 'lr': 5e-4 * _lr_camera},
+            {'params': [unique_gl_T], 'lr': 5e-3 * _lr_camera},
+            {'params': [unique_gl_R_6d], 'lr': 5e-4 * _lr_camera},
             {'params': [joints_offset], 'lr': 1e-5 * _lr_decay},
             {'params': [g_flame_shape], 'lr': 2e-5 * _lr_decay},
             {'params': [head_scale], 'lr': 1e-4 * _lr_decay},
             {'params': [hand_scale], 'lr': 1e-4 * _lr_decay},
-        ])
+        ]
+        
+        if not share_pose:
+            opt_params.extend([
+                {'params': [unique_body_pose], 'lr': 1e-3},
+                {'params': [unique_left_hand_pose], 'lr': 1e-5},
+                {'params': [unique_right_hand_pose], 'lr': 1e-5},
+                {'params': [unique_global_pose], 'lr': 1e-3},
+            ])
+        else:
+            opt_params.extend([
+                {'params': [body_pose], 'lr': 1e-3},
+                {'params': [left_hand_pose], 'lr': 1e-5},
+                {'params': [right_hand_pose], 'lr': 1e-5},
+            ])
+        
+        opt_p = torch.optim.AdamW(opt_params)
         
         # Optimization loop
         t_bar = tqdm(range(steps), desc='Tuning SMPLX global params')
@@ -498,13 +864,29 @@ class RefineSmplxPipeline(object):
             batch_mano_right['betas'] = right_hand_shape.expand(batch_size, -1)
             batch_flame['shape_params'] = g_flame_shape.expand(batch_size, -1)
             
-            batch_smplx['body_pose'] = body_pose.expand(batch_size, -1, -1)
-            batch_smplx['global_pose'] = global_pose.expand(batch_size, -1)
-            batch_smplx['left_hand_pose'] = left_hand_pose.expand(batch_size, -1, -1)
-            batch_smplx['right_hand_pose'] = right_hand_pose.expand(batch_size, -1, -1)
+            # Expand unique poses to batch size using mapping
+            if not share_pose:
+                body_pose = unique_body_pose[batch_to_pose_idx]
+                global_pose = unique_global_pose[batch_to_pose_idx]
+                left_hand_pose = unique_left_hand_pose[batch_to_pose_idx]
+                right_hand_pose = unique_right_hand_pose[batch_to_pose_idx]
+            
+            batch_smplx['body_pose'] = body_pose.expand(batch_size, -1, -1) if share_pose else body_pose
+            batch_smplx['global_pose'] = global_pose.expand(batch_size, -1) if share_pose else global_pose
+            batch_smplx['left_hand_pose'] = left_hand_pose.expand(batch_size, -1, -1) if share_pose else left_hand_pose
+            batch_smplx['right_hand_pose'] = right_hand_pose.expand(batch_size, -1, -1) if share_pose else right_hand_pose
+            
+            # Expand camera parameters (regular directly, PSHuman derived)
+            gl_T, gl_R_6d = make_camera_R6d_T(
+                unique_gl_T, unique_gl_R_6d, batch_to_camera_idx,
+                unique_cameras, camera_to_idx, camera_is_pshuman, camera_source_key,
+                batch_size, self.device
+            )
             
             if self.use_vposer:
-                body_embedding_mean = self.vposer.encode(body_pose).mean
+                # VPoser expects unique poses
+                vp_body_pose = unique_body_pose if not share_pose else body_pose
+                body_embedding_mean = self.vposer.encode(vp_body_pose).mean
             else:
                 body_embedding_mean = 0
             
@@ -638,11 +1020,42 @@ class RefineSmplxPipeline(object):
             ### Motion regularization loss
             mtn_reg_loss = 0
             if body_pose.shape[0] > 1:
-                mtn_reg_loss += self.metric(body_pose[1:], body_pose[:-1]) * lambda_mtn_body_pose / (interval * 1)
-                mtn_reg_loss += self.metric(gl_R_6d[1:], gl_R_6d[:-1]) * lambda_mtn_rot6d / (interval * 1)
-                mtn_reg_loss += self.metric(T[1:], T[:-1]) * lambda_mtn_trans / (interval * 1)
-                mtn_reg_loss += self.metric(T[1:, 2], T[:-1, 2]) * lambda_mtn_trans_z / (interval * 1)
-                mtn_reg_loss += self.metric(proj_vertices[1:], proj_vertices[:-1]) * lambda_mtn_vertices / (interval * 1)
+                # Helper for anchored motion loss
+                def get_anchored_diff(tensor, is_anchor):
+                    curr = tensor[1:]
+                    prev = tensor[:-1]
+                    return curr, prev
+                    # curr_anchor = is_anchor[1:]
+                    # prev_anchor = is_anchor[:-1]
+                    
+                    # view_shape = [-1] + [1] * (tensor.ndim - 1)
+                    # curr_mask = curr_anchor.view(*view_shape)
+                    # prev_mask = prev_anchor.view(*view_shape)
+                    
+                    # curr_term = torch.where(curr_mask, curr.detach(), curr)
+                    # prev_term = torch.where(prev_mask, prev.detach(), prev)
+                    # return curr_term, prev_term
+
+                curr_bp, prev_bp = get_anchored_diff(body_pose, is_pshuman_tensor)
+                mtn_reg_loss += self.metric(curr_bp, prev_bp) * lambda_mtn_body_pose / (interval * 1)
+                
+                curr_lhp, prev_lhp = get_anchored_diff(left_hand_pose, is_pshuman_tensor)
+                mtn_reg_loss += self.metric(curr_lhp, prev_lhp) * lambda_mtn_hand_pose / (interval * 1)
+                
+                curr_rhp, prev_rhp = get_anchored_diff(right_hand_pose, is_pshuman_tensor)
+                mtn_reg_loss += self.metric(curr_rhp, prev_rhp) * lambda_mtn_hand_pose / (interval * 1)
+                
+                curr_rot, prev_rot = get_anchored_diff(gl_R_6d, is_pshuman_tensor)
+                mtn_reg_loss += self.metric(curr_rot, prev_rot) * lambda_mtn_rot6d / (interval * 1)
+                
+                curr_T, prev_T = get_anchored_diff(T, is_pshuman_tensor)
+                mtn_reg_loss += self.metric(curr_T, prev_T) * lambda_mtn_trans / (interval * 1)
+                
+                curr_Tz, prev_Tz = get_anchored_diff(T[..., 2:3], is_pshuman_tensor)
+                mtn_reg_loss += self.metric(curr_Tz, prev_Tz) * lambda_mtn_trans_z / (interval * 1)
+                
+                curr_v, prev_v = get_anchored_diff(proj_vertices, is_pshuman_tensor)
+                mtn_reg_loss += self.metric(curr_v, prev_v) * lambda_mtn_vertices / (interval * 1)
             
             total_loss = loss_3d + loss_2d + loss_prior + mtn_reg_loss
             loss_line = f'total: {total_loss:.2f} | 3d: {loss_3d:.2f} | 2d: {loss_2d:.2f} | prior: {loss_prior:.2f} | mtn: {mtn_reg_loss:.2f}'
@@ -656,16 +1069,38 @@ class RefineSmplxPipeline(object):
             # Visualization at iter 0 and last step
             if batch_imgs is not None and (i_step == 0 or i_step == steps - 1):
                 self._visualize_smplx(batch_imgs, smplx_dict, gt_lmk_2d, pred_kps3d, proj_face_lmk_203,
-                                    ref_hand_l_joints, ref_hand_r_joints, ref_head_vertices,
-                                    ref_hand_l_vertices, ref_hand_r_vertices,
-                                    head_lmk_valid, left_hand_valid, right_hand_valid,
-                                    R, T, cameras, batch_id, i_step,
-                                    body_kpt2d_indices, knee_feet_indices, face_kpt2d_indices,
-                                    lhand_kpt2d_indices, rhand_kpt2d_indices)
+                                      ref_hand_l_joints, ref_hand_r_joints, ref_head_vertices,
+                                      ref_hand_l_vertices, ref_hand_r_vertices,
+                                      head_lmk_valid, left_hand_valid, right_hand_valid,
+                                      R, T, cameras, batch_id, i_step,
+                                      body_kpt2d_indices, knee_feet_indices, face_kpt2d_indices,
+                                      lhand_kpt2d_indices, rhand_kpt2d_indices)
         
-        # Update camera parameters
-        batch_smplx['camera_RT_params'][:, :3, 3] = gl_T.detach()
-        batch_smplx['camera_RT_params'][:, :3, :3] = rotation_6d_to_matrix(gl_R_6d.detach())
+        # Build final camera RT for each batch index
+        final_gl_T, final_gl_R_6d = make_camera_R6d_T(
+            unique_gl_T.detach(), unique_gl_R_6d.detach(), batch_to_camera_idx,
+            unique_cameras, camera_to_idx, camera_is_pshuman, camera_source_key,
+            batch_size, self.device
+        )
+        
+        final_camera_RT_list = []
+        for batch_idx in range(batch_size):
+            final_RT = torch.eye(4, device=self.device, dtype=torch.float32)
+            final_RT[:3, 3] = final_gl_T[batch_idx]
+            final_RT[:3, :3] = rotation_6d_to_matrix(final_gl_R_6d[batch_idx])
+            final_camera_RT_list.append(final_RT[:3, :4])
+        
+        final_camera_RT = torch.stack(final_camera_RT_list, dim=0)
+        final_body_pose = unique_body_pose[batch_to_pose_idx] if not share_pose else body_pose
+        final_global_pose = unique_global_pose[batch_to_pose_idx] if not share_pose else global_pose
+        final_left_hand_pose = unique_left_hand_pose[batch_to_pose_idx] if not share_pose else left_hand_pose
+        final_right_hand_pose = unique_right_hand_pose[batch_to_pose_idx] if not share_pose else right_hand_pose
+        
+        batch_smplx['camera_RT_params'] = final_camera_RT
+        batch_smplx['body_pose'] = final_body_pose
+        batch_smplx['global_pose'] = final_global_pose
+        batch_smplx['left_hand_pose'] = final_left_hand_pose
+        batch_smplx['right_hand_pose'] = final_right_hand_pose
         
         # Package optimized results
         optim_smplx_results = {}
@@ -678,12 +1113,12 @@ class RefineSmplxPipeline(object):
         for idx, name in enumerate(track_frames):
             optim_smplx_results[name] = {
                 'exp': batch_smplx['exp'][idx].detach().float().cpu().numpy(),
-                'global_pose': batch_smplx['global_pose'][idx].detach().float().cpu().numpy(),
-                'body_pose': batch_smplx['body_pose'][idx].detach().float().cpu().numpy(),
+                'global_pose': final_global_pose[idx].detach().float().cpu().numpy(),
+                'body_pose': final_body_pose[idx].detach().float().cpu().numpy(),
                 'body_cam': batch_smplx['body_cam'][idx].detach().float().cpu().numpy(),
-                'camera_RT_params': batch_smplx['camera_RT_params'][idx].detach().float().cpu().numpy(),
-                'left_hand_pose': batch_smplx['left_hand_pose'][idx].detach().float().cpu().numpy(),
-                'right_hand_pose': batch_smplx['right_hand_pose'][idx].detach().float().cpu().numpy(),
+                'camera_RT_params': final_camera_RT[idx].detach().float().cpu().numpy(),
+                'left_hand_pose': final_left_hand_pose[idx].detach().float().cpu().numpy(),
+                'right_hand_pose': final_right_hand_pose[idx].detach().float().cpu().numpy(),
             }
         
         return optim_smplx_results, id_share_params
@@ -750,7 +1185,7 @@ class RefineSmplxPipeline(object):
             t_camera = GS_Camera(**self.build_cameras_kwargs(1, self.body_focal_length),
                                 R=R[None, im_idx], T=T[None, im_idx])
             mesh_img = self.body_renderer.render_mesh(smplx_dict['vertices'][None, im_idx, ...],
-                                                     t_camera, lights=lights)
+                                                      t_camera, lights=lights)
             mesh_img = (mesh_img[:, :3].detach().cpu().numpy()).clip(0, 255).astype(np.uint8)[0].transpose(1, 2, 0)
             mesh_img = cv2.addWeighted(_img, 0.3, mesh_img, 0.7, 0)
             
@@ -778,15 +1213,15 @@ class RefineSmplxPipeline(object):
             vis_imgs.append(_img)
         
         if len(vis_imgs) > 0:
-            # Calculate 2:1 aspect ratio grid layout
+            # Calculate 1:2 aspect ratio grid layout
             total_frames = len(vis_imgs)
-            grid_rows = max(1, int(np.sqrt(total_frames / 2)))
+            grid_rows = max(1, int(np.sqrt(total_frames * 2)))
             grid_cols = int(np.ceil(total_frames / grid_rows))
             
-            # Adjust to maintain 2:1 ratio
-            while grid_cols < 2 * grid_rows and grid_rows > 1:
-                grid_rows -= 1
-                grid_cols = int(np.ceil(total_frames / grid_rows))
+            # Adjust to maintain 1:2 ratio
+            while grid_rows < 2 * grid_cols and grid_cols > 1:
+                grid_cols -= 1
+                grid_rows = int(np.ceil(total_frames / grid_cols))
             
             # Get dimensions
             img_height, img_width = vis_imgs[0].shape[:2]
@@ -836,15 +1271,15 @@ class RefineSmplxPipeline(object):
             print(f"  Warning: No valid frames found for preview")
             return
         
-        # Calculate 2:1 aspect ratio grid layout
+        # Calculate 1:2 aspect ratio grid layout
         total_frames = len(valid_keys)
-        grid_rows = max(1, int(np.sqrt(total_frames / 2)))
+        grid_rows = max(1, int(np.sqrt(total_frames * 2)))
         grid_cols = int(np.ceil(total_frames / grid_rows))
         
-        # Adjust to maintain 2:1 ratio
-        while grid_cols < 2 * grid_rows and grid_rows > 1:
-            grid_rows -= 1
-            grid_cols = int(np.ceil(total_frames / grid_rows))
+        # Adjust to maintain 1:2 ratio
+        while grid_rows < 2 * grid_cols and grid_cols > 1:
+            grid_cols -= 1
+            grid_rows = int(np.ceil(total_frames / grid_cols))
         
         # Render sample frames for preview
         from .modules.refiner.smplx_utils import smplx_joints_to_dwpose
@@ -869,11 +1304,11 @@ class RefineSmplxPipeline(object):
         
         # Recalculate grid for sampled frames
         total_frames = len(preview_images)
-        grid_rows = max(1, int(np.sqrt(total_frames / 2)))
+        grid_rows = max(1, int(np.sqrt(total_frames * 2)))
         grid_cols = int(np.ceil(total_frames / grid_rows))
-        while grid_cols < 2 * grid_rows and grid_rows > 1:
-            grid_rows -= 1
-            grid_cols = int(np.ceil(total_frames / grid_rows))
+        while grid_rows < 2 * grid_cols and grid_cols > 1:
+            grid_cols -= 1
+            grid_rows = int(np.ceil(total_frames / grid_cols))
         
         # Create blank grid
         grid_height = grid_rows * img_height

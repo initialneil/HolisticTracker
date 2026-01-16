@@ -737,6 +737,14 @@ class RefineFlamePipeline(object):
         
         # Collate all frames
         batch_flame_lmk = [tracked_rlt[key] for key in all_frame_keys]
+
+        # special fix for dwpose_raw.bbox
+        for idx, item in enumerate(batch_flame_lmk):
+            if 'dwpose_raw' in item and 'bbox' in item['dwpose_raw']:
+                if item['dwpose_raw']['bbox'].shape[0] == 0:
+                    print(f"Warning: frame [{idx}] {all_frame_keys[idx]} has empty dwpose_raw.bbox, fix to [0,0,0,0]")
+                    item['dwpose_raw']['bbox'] = np.zeros((4))
+
         batch_flame_lmk = torch.utils.data.default_collate(batch_flame_lmk)
         batch_flame_lmk = data_to_device(batch_flame_lmk, device=self.device)
         
