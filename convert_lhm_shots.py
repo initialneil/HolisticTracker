@@ -655,7 +655,7 @@ def convert_shot_to_ehm(video_lhm_dir, video_name, shot_name, args):
     shot_key = f"{video_name}/{shot_name}"
     output_info = {
         'videos_info': {
-            shot_key: {
+            video_name: {
                 'frames_num': len(shot_tracking),
                 'frames_keys': sorted(shot_tracking.keys())
             }
@@ -872,7 +872,7 @@ def main():
                 print(f"  Skipping visualization: {copy_dest} already exists (use --overwrite to regenerate)")
             else:
                 # Generate visualization
-                video_data = output_info['videos_info'][shot_key].copy()
+                video_data = output_info['videos_info'][video_name].copy()
                 video_data['fps'] = video_data.get('fps', 24)  # Default to 24 fps
                 
                 visualize_tracking(shot_key, video_data, output_dir, args, smplx_pipeline, cfg)
