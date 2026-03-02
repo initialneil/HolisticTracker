@@ -21,7 +21,10 @@ from .utils.graphics import GS_Camera
 from .utils.draw import draw_landmarks
 from .utils import rotation_converter as converter
 from .losses import Landmark2DLoss, PoseLoss
-from .modules.refiner.smplx_utils import smplx_joints_to_dwpose, smplx_to_dwpose
+from .modules.refiner.smplx_utils import (
+    smplx_joints_to_dwpose, smplx_to_dwpose,
+    smplx_joints_to_sapiens, smplx_to_sapiens,
+)
 from .ehmx_track_base import split_frame_key
 
 np.random.seed(0)
@@ -391,8 +394,14 @@ class RefineSmplxPipeline(object):
             self.vposer = self.vposer.to(device=self.device)
             self.vposer.eval()
         
-        # Get keypoint mappings
-        self.kps_map, kps_w = smplx_to_dwpose()
+        # Get keypoint mappings (sapiens vs dwpose)
+        self.body_landmark_type = getattr(cfg, 'body_landmark_type', 'dwpose')
+        if self.body_landmark_type == 'sapiens':
+            self.kps_map, kps_w = smplx_to_sapiens()
+            self.smplx_joints_to_body_lmk = smplx_joints_to_sapiens
+        else:
+            self.kps_map, kps_w = smplx_to_dwpose()
+            self.smplx_joints_to_body_lmk = smplx_joints_to_dwpose
         self.kps_w = torch.from_numpy(kps_w).unsqueeze(0).to(self.device)
         
         self.saving_root = None
@@ -560,7 +569,7 @@ class RefineSmplxPipeline(object):
         batch_size = len(track_frames)
         batch_smplx = batch_base['smplx_coeffs']
         batch_flame = batch_base['flame_coeffs']
-        gt_lmk_2d = batch_base['dwpose_rlt']
+        gt_lmk_2d = batch_base.get('body_lmk_rlt', batch_base.get('dwpose_rlt'))
         batch_mano_left = batch_base['left_mano_coeffs']
         batch_mano_right = batch_base['right_mano_coeffs']
         head_lmk_valid = batch_base['head_lmk_valid']
@@ -780,7 +789,7 @@ class RefineSmplxPipeline(object):
             T = T.squeeze(-1)
             ref_proj_vertices = cameras.transform_points_screen(smplx_init_dict['vertices'], R=R, T=T)
             ref_proj_joints = cameras.transform_points_screen(smplx_init_dict['joints'], R=R, T=T)
-            ret_body_ref = smplx_joints_to_dwpose(ref_proj_joints)[0]
+            ret_body_ref = self.smplx_joints_to_body_lmk(ref_proj_joints)[0]
         
         # Setup optimization parameters
         g_smplx_shape.requires_grad = True
@@ -932,13 +941,28 @@ class RefineSmplxPipeline(object):
             loss_3d = (loss_3d_head + loss_3d_hand_l + loss_3d_hand_r + loss_3d_z)
             
             ### 2D landmark loss
-            pred_kps3d = smplx_joints_to_dwpose(proj_joints)[0]
+            pred_kps3d = self.smplx_joints_to_body_lmk(proj_joints)[0]
             
-            # Define keypoint groups
-            knee_feet_indices = [9, 10, 12, 13, 18, 19, 20, 21, 22, 23]
-            face_kpt2d_indices = list(range(24, 92)) + [14, 15, 16, 17]
-            lhand_kpt2d_indices = list(range(92, 113)) + [6, 7]
-            rhand_kpt2d_indices = list(range(113, 134)) + [3, 4]
+            # Define keypoint groups (format-aware)
+            if self.body_landmark_type == 'sapiens':
+                # COCO Wholebody 133-keypoint ordering
+                knee_feet_indices = [13, 14, 15, 16, 17, 18, 19, 20, 21, 22]
+                face_kpt2d_indices = list(range(23, 91)) + [0, 1, 2, 3, 4]
+                lhand_kpt2d_indices = list(range(91, 112)) + [7, 9]
+                rhand_kpt2d_indices = list(range(112, 133)) + [8, 10]
+                # Fallback anchor indices for invalid regions
+                _face_anchor = 0   # nose
+                _lhand_anchor = 9  # left_wrist
+                _rhand_anchor = 10 # right_wrist
+            else:
+                # DWPose / openpose 134-keypoint ordering
+                knee_feet_indices = [9, 10, 12, 13, 18, 19, 20, 21, 22, 23]
+                face_kpt2d_indices = list(range(24, 92)) + [14, 15, 16, 17]
+                lhand_kpt2d_indices = list(range(92, 113)) + [6, 7]
+                rhand_kpt2d_indices = list(range(113, 134)) + [3, 4]
+                _face_anchor = 15  # left_eye
+                _lhand_anchor = 7  # left_wrist
+                _rhand_anchor = 4  # right_wrist
             all_kpt2d_indices = list(range(pred_kps3d.shape[1]))
             body_kpt2d_indices = [i for i in all_kpt2d_indices 
                                  if i not in knee_feet_indices and i not in face_kpt2d_indices 
@@ -965,8 +989,8 @@ class RefineSmplxPipeline(object):
                 ) * lambda_2d_kpt
             if (~head_lmk_valid).sum() > 0:
                 loss_2d_face += self.metric(
-                    pred_kps3d[~head_lmk_valid][:, 15, :2],
-                    ret_body_ref[~head_lmk_valid][:, 15, :2]
+                    pred_kps3d[~head_lmk_valid][:, _face_anchor, :2],
+                    ret_body_ref[~head_lmk_valid][:, _face_anchor, :2]
                 ) * lambda_smplx_init
             
             # Left hand landmarks loss
@@ -978,8 +1002,8 @@ class RefineSmplxPipeline(object):
                 ) * lambda_2d_kpt
             if (~left_hand_valid).sum() > 0:
                 loss_2d_lhand += self.metric(
-                    pred_kps3d[~left_hand_valid][:, 7, :2],
-                    ret_body_ref[~left_hand_valid][:, 7, :2]
+                    pred_kps3d[~left_hand_valid][:, _lhand_anchor, :2],
+                    ret_body_ref[~left_hand_valid][:, _lhand_anchor, :2]
                 ) * lambda_smplx_init
             
             # Right hand landmarks loss
@@ -991,8 +1015,8 @@ class RefineSmplxPipeline(object):
                 ) * lambda_2d_kpt
             if (~right_hand_valid).sum() > 0:
                 loss_2d_rhand += self.metric(
-                    pred_kps3d[~right_hand_valid][:, 4, :2],
-                    ret_body_ref[~right_hand_valid][:, 4, :2]
+                    pred_kps3d[~right_hand_valid][:, _rhand_anchor, :2],
+                    ret_body_ref[~right_hand_valid][:, _rhand_anchor, :2]
                 ) * lambda_smplx_init
             
             loss_2d = loss_2d_kpt + loss_2d_knee_feet + loss_2d_face + loss_2d_lhand + loss_2d_rhand
@@ -1282,7 +1306,6 @@ class RefineSmplxPipeline(object):
             grid_rows = int(np.ceil(total_frames / grid_cols))
         
         # Render sample frames for preview
-        from .modules.refiner.smplx_utils import smplx_joints_to_dwpose
         from pytorch3d.renderer import PointLights
         
         # Select frames for preview (max 20 frames)
@@ -1292,10 +1315,11 @@ class RefineSmplxPipeline(object):
         for frame_key in tqdm(sample_keys, desc="Rendering preview frames"):
             body_img = body_images[frame_key].numpy().transpose(1, 2, 0).astype(np.uint8).copy()
             
-            # Draw DWPose keypoints if available
-            if 'dwpose_rlt' in base_results[frame_key]:
-                dwpose_kpts = base_results[frame_key]['dwpose_rlt']['keypoints']
-                body_img = draw_landmarks(dwpose_kpts, body_img, color=(0, 255, 0), radius=2)
+            # Draw body landmark keypoints if available
+            _lmk_key = 'body_lmk_rlt' if 'body_lmk_rlt' in base_results[frame_key] else 'dwpose_rlt'
+            if _lmk_key in base_results[frame_key]:
+                body_kpts = base_results[frame_key][_lmk_key]['keypoints']
+                body_img = draw_landmarks(body_kpts, body_img, color=(0, 255, 0), radius=2)
             
             preview_images.append(body_img)
         

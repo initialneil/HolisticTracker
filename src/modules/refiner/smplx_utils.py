@@ -266,3 +266,108 @@ def smplx_joints_to_dwpose(joints3d):
     ret_kps3d[:, 1, :2] = (ret_kps3d[:, 2, :2] + ret_kps3d[:, 5, :2]) / 2
 
     return ret_kps3d, weights
+
+
+def _sapiens_mapping():
+    """Build COCO Wholebody 133-keypoint mapping from EHM 145 joints.
+
+    Returns the index array (133,) where mapping[i] is the EHM joint index
+    for COCO Wholebody keypoint i.
+    """
+    # Body (COCO 0-16)
+    body_mapping = np.array([
+        68,   # 0:  nose (face inner landmark)
+        23,   # 1:  left_eye (SMPLX left_eye joint)
+        24,   # 2:  right_eye (SMPLX right_eye joint)
+        122,  # 3:  left_ear (face contour endpoint)
+        107,  # 4:  right_ear (face contour endpoint)
+        16,   # 5:  left_shoulder
+        17,   # 6:  right_shoulder
+        18,   # 7:  left_elbow
+        19,   # 8:  right_elbow
+        20,   # 9:  left_wrist
+        21,   # 10: right_wrist
+        1,    # 11: left_hip
+        2,    # 12: right_hip
+        4,    # 13: left_knee
+        5,    # 14: right_knee
+        7,    # 15: left_ankle
+        8,    # 16: right_ankle
+    ], dtype=np.int32)
+
+    # Feet (COCO 17-22)
+    feet_mapping = np.array([
+        124,  # 17: left_bigtoe
+        132,  # 18: left_smalltoe
+        10,   # 19: left_heel (SMPLX left_foot)
+        135,  # 20: right_bigtoe
+        143,  # 21: right_smalltoe
+        11,   # 22: right_heel (SMPLX right_foot)
+    ], dtype=np.int32)
+
+    # Face contour (COCO 23-39): 17 points, EHM 106-122
+    face_contour_mapping = np.arange(106, 123, dtype=np.int32)
+
+    # Face inner (COCO 40-90): 51 points, EHM 55-105
+    face_inner_mapping = np.arange(55, 106, dtype=np.int32)
+
+    # Left hand (COCO 91-111): 21 keypoints in openpose hand order
+    lhand_mapping = np.array([
+        20,   # 91:  wrist
+        37, 38, 39, 133,    # thumb
+        25, 26, 27, 128,    # index
+        28, 29, 30, 129,    # middle
+        34, 35, 36, 131,    # ring
+        31, 32, 33, 130,    # pinky
+    ], dtype=np.int32)
+
+    # Right hand (COCO 112-132): 21 keypoints
+    rhand_mapping = np.array([
+        21,   # 112: wrist
+        52, 53, 54, 144,    # thumb
+        40, 41, 42, 139,    # index
+        43, 44, 45, 140,    # middle
+        49, 50, 51, 142,    # ring
+        46, 47, 48, 141,    # pinky
+    ], dtype=np.int32)
+
+    return np.concatenate([body_mapping, feet_mapping, face_contour_mapping,
+                           face_inner_mapping, lhand_mapping, rhand_mapping])
+
+
+def _sapiens_weights():
+    """Build per-keypoint optimization weights for COCO Wholebody 133 format."""
+    weights = np.ones([133])
+    weights[np.array([0, 1, 2, 3, 4])] = 0       # nose, eyes, ears
+    weights[np.arange(23, 40)] = 5                  # face contour
+    weights[np.arange(91, 133)] = 10                # hands
+    weights[np.array([7, 8, 9, 10, 13, 14, 15, 16,
+                      17, 18, 19, 20, 21, 22])] = 20  # limbs + feet
+    weights[np.array([5, 6])] = 50                  # shoulders
+    weights[np.array([7, 8])] = 100                 # elbows (highest)
+    return weights
+
+
+def smplx_to_sapiens():
+    """Return (mapping[133], weights[133]) for COCO Wholebody 133-keypoint format.
+
+    ``mapping[i]`` is the EHM-145 joint index for COCO Wholebody keypoint *i*.
+    No synthetic joints are needed (unlike DWPose neck).
+    """
+    return _sapiens_mapping(), _sapiens_weights()
+
+
+def smplx_joints_to_sapiens(joints3d):
+    """Project EHM joints to COCO Wholebody 133-keypoint ordering.
+
+    Args:
+        joints3d: (B, 145, 3) EHM joint tensor
+
+    Returns:
+        ret_kps3d: (B, 133, 3) re-ordered keypoints
+        weights:   (133,) per-keypoint weights
+    """
+    mapping = _sapiens_mapping()
+    weights = _sapiens_weights()
+    ret_kps3d = joints3d[:, mapping]
+    return ret_kps3d, weights

@@ -1,0 +1,6 @@
+target: src.modules.sapiens.SapiensDetector
+params:
+  ckpt_path: pretrained/sapiens/sapiens_1b_coco_wholebody_best_coco_wholebody_AP_727_torchscript.pt2
+  yolox_ckpt_dir: pretrained/dwpose
+  input_shape: [1024, 768]
+  num_keypoints: 133
