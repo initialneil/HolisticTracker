@@ -291,6 +291,9 @@ def main():
                         help='Path to optimization config file')
     parser.add_argument('--overwrite', action='store_true',
                         help='Overwrite existing refined results')
+    parser.add_argument('--body_landmark_type', type=str, default='sapiens',
+                        choices=['sapiens', 'dwpose'],
+                        help='Body landmark detector type (default: sapiens)')
     
     args = parser.parse_args()
     
@@ -335,6 +338,8 @@ def main():
     # Load data preparation config
     print(f"\nInitializing SMPL-X refinement pipeline...")
     cfg = DataPreparationConfig()
+    cfg.body_landmark_type = args.body_landmark_type
+    print(f"Body landmark type: {cfg.body_landmark_type}")
     
     # Initialize SMPL-X refinement pipeline
     smplx_pipeline = RefineSmplxPipeline(cfg)

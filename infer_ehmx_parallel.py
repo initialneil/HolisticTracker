@@ -75,6 +75,7 @@ def run_video_pipeline(video_name, json_path, args, gpu_id):
         '--images_dir', args.images_dir,
         '--index_json', json_path,
         '--ehmx_dir', args.ehmx_dir,
+        '--body_landmark_type', args.body_landmark_type,
     ]
     
     if args.mattes_dir:
@@ -244,6 +245,9 @@ def main():
                         help='Overwrite config.check_hand_score if set')
     parser.add_argument('--config', type=str, default=None,
                         help='Path to optimization config file')
+    parser.add_argument('--body_landmark_type', type=str, default='sapiens',
+                        choices=['sapiens', 'dwpose'],
+                        help='Body landmark detector type (default: sapiens)')
     
     args = parser.parse_args()
     

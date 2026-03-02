@@ -99,15 +99,16 @@ def process_video(video_name, video_data, args, pipeline):
     return base_results, id_share_params, ret_images_dict
 
 
-def save_results(video_name, base_results, id_share_params, out_dir):
+def save_results(video_name, base_results, id_share_params, out_dir, info):
     """
-    Save base tracking results to pickle files.
+    Save base tracking results to pickle files, plus videos_info.json and extra_info.json.
     
     Args:
         video_name: Name of the video
         base_results: Dictionary of per-frame base tracking results
         id_share_params: Dictionary of identity-shared parameters
         out_dir: Output directory
+        info: Dictionary with 'images_dir', 'mattes_dir', 'pshuman_dir'
     """
     video_out_dir = os.path.join(out_dir, video_name)
     os.makedirs(video_out_dir, exist_ok=True)
@@ -125,6 +126,29 @@ def save_results(video_name, base_results, id_share_params, out_dir):
     
     print(f"  Saved base tracking to: {base_track_path}")
     print(f"  Saved id share params to: {id_share_path}")
+    
+    # Save videos_info.json
+    videos_info = {
+        video_name: {
+            'frames_num': len(base_results),
+            'frames_keys': sorted(base_results.keys())
+        }
+    }
+    videos_info_path = os.path.join(video_out_dir, 'videos_info.json')
+    with open(videos_info_path, 'w') as f:
+        json.dump(videos_info, f, indent=2)
+    print(f"  Saved videos_info to: {videos_info_path}")
+    
+    # Save extra_info.json
+    extra_info = {
+        'frames_root': info['images_dir'],
+        'matte_root': info['mattes_dir'],
+        'pshuman_root': info['pshuman_dir']
+    }
+    extra_info_path = os.path.join(video_out_dir, 'extra_info.json')
+    with open(extra_info_path, 'w') as f:
+        json.dump(extra_info, f, indent=4)
+    print(f"  Saved extra_info to: {extra_info_path}")
 
 
 def generate_visualization(video_name, video_data, ret_images_dict, base_results, out_dir, pipeline):
@@ -164,6 +188,9 @@ def main():
                         help='Directory for EHM-X tracking results')
     parser.add_argument('--check_hand_score', type=float, default=None,
                         help='Overwrite config.check_hand_score if set')
+    parser.add_argument('--body_landmark_type', type=str, default='sapiens',
+                        choices=['sapiens', 'dwpose'],
+                        help='Body landmark detector type (default: sapiens)')
     parser.add_argument('--overwrite', action='store_true',
                         help='Overwrite existing results')
     
@@ -179,6 +206,8 @@ def main():
     # Initialize pipeline
     print("\nInitializing TrackBasePipeline...")
     config = DataPreparationConfig()
+    config.body_landmark_type = args.body_landmark_type
+    print(f"Body landmark type: {config.body_landmark_type}")
     if args.check_hand_score is not None:
         config.check_hand_score = args.check_hand_score
         print(f"Overwriting config.check_hand_score to {config.check_hand_score}")
@@ -238,7 +267,12 @@ def main():
             continue
         
         # Save results
-        save_results(video_name, base_results, id_share_params, args.ehmx_dir)
+        info = {
+            'images_dir': args.images_dir,
+            'mattes_dir': args.mattes_dir,
+            'pshuman_dir': args.pshuman_dir
+        }
+        save_results(video_name, base_results, id_share_params, args.ehmx_dir, info)
         
         # Generate visualization with landmarks
         generate_visualization(video_name, video_data, ret_images_dict, base_results, args.ehmx_dir, pipeline)

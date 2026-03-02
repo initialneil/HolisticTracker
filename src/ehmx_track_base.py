@@ -13,6 +13,7 @@ from .utils.crop import crop_image, parse_bbox_from_landmark_lite, crop_image_by
 from .utils.landmark_runner import LandmarkRunner
 from .modules.smplx.utils import orginaze_body_pose
 from .modules.renderer.util import cam2persp_cam_fov, cam2persp_cam_fov_body
+from .configs.data_prepare_config import DataPreparationConfig
 
 
 def load_image(image_path):
@@ -84,7 +85,7 @@ class TrackBasePipeline:
     Only uses no_body_crop mode (processes images directly without body cropping).
     """
     
-    def __init__(self, config):
+    def __init__(self, config: DataPreparationConfig):
         """
         Initialize the tracking pipeline.
         
@@ -96,8 +97,13 @@ class TrackBasePipeline:
         
         # Initialize detection and encoding models
         print("Initializing models...")
-        self.dwpose_detector = instantiate_from_config(load_config(self.cfg.dwpose_cfg_path))
-        self.dwpose_detector.warmup()
+        self.body_landmark_type = config.body_landmark_type
+        if self.body_landmark_type == 'sapiens':
+            self.body_lmk_detector = instantiate_from_config(load_config(self.cfg.sapiens_cfg_path))
+            self.body_lmk_detector.warmup()
+        else:
+            self.body_lmk_detector = instantiate_from_config(load_config(self.cfg.dwpose_cfg_path))
+            self.body_lmk_detector.warmup()
         
         self.pixie_encoder = instantiate_from_config(load_config(self.cfg.pixie_cfg_path))
         self.pixie_encoder.to(self.device)
@@ -154,7 +160,7 @@ class TrackBasePipeline:
         ret_images['ori_image'] = img_rgb
         
         # Detect body pose and keypoints
-        det_info, det_raw_info = self.dwpose_detector(img_rgb)
+        det_info, det_raw_info = self.body_lmk_detector(img_rgb)
         
         # Handle no_body_crop mode
         if no_body_crop:
@@ -189,21 +195,29 @@ class TrackBasePipeline:
             'M_o2c-hd': crop_info_hd['M_o2c'], 
             'M_c2o-hd': crop_info_hd['M_c2o']
         }
-        base_results['dwpose_raw'] = det_raw_info
-        base_results['dwpose_rlt'] = {
+        # Store landmark results under unified key with format tag
+        body_lmk_rlt = {
             'keypoints': _transform_pts(det_raw_info['keypoints'], crop_info_hd['M_o2c']),
             'scores': det_raw_info['scores'],
             'faces': det_info['faces'],
-            'hands': det_info['hands']
+            'hands': det_info['hands'],
+            'format': self.body_landmark_type,
         }
+        base_results['body_lmk_rlt'] = body_lmk_rlt
+        # backward-compat alias
+        base_results['dwpose_raw'] = det_raw_info
+        base_results['dwpose_rlt'] = body_lmk_rlt
         
         # Check hand validity
+        # NOTE: negative slicing works for both 134-kps (DWPose) and 133-kps (Sapiens)
+        #   DWPose:  [-42:-21]=left hand (92-112), [-21:]=right hand (113-133)
+        #   Sapiens: [-42:-21]=left hand (91-111), [-21:]=right hand (112-132)
         if not skip_hands:
-            if base_results['dwpose_rlt']['scores'][-42:-21].mean() >= self.cfg.check_hand_score:
+            if body_lmk_rlt['scores'][-42:-21].mean() >= self.cfg.check_hand_score:
                 base_results['left_hand_valid'] = True
             else:
                 base_results['left_hand_valid'] = False
-            if base_results['dwpose_rlt']['scores'][-21:].mean() >= self.cfg.check_hand_score:
+            if body_lmk_rlt['scores'][-21:].mean() >= self.cfg.check_hand_score:
                 base_results['right_hand_valid'] = True
             else:
                 base_results['right_hand_valid'] = False
@@ -212,8 +226,8 @@ class TrackBasePipeline:
             base_results['right_hand_valid'] = False
         
         # Check if hands are crossing
-        if ((base_results['dwpose_rlt']['keypoints'][-42:-21] - 
-             base_results['dwpose_rlt']['keypoints'][-21:])**2).mean() < self.cfg.check_hand_dist:
+        if ((body_lmk_rlt['keypoints'][-42:-21] - 
+             body_lmk_rlt['keypoints'][-21:])**2).mean() < self.cfg.check_hand_dist:
             base_results['left_hand_valid'] = False
             base_results['right_hand_valid'] = False
         
@@ -676,13 +690,13 @@ class TrackBasePipeline:
                 body_resized = cv2.resize(body_img, (cell_width, body_height))
                 
                 # Draw dwpose keypoints on body image
-                if frame_base_results and 'dwpose_rlt' in frame_base_results:
-                    dwpose_rlt = frame_base_results['dwpose_rlt']
-                    if 'keypoints' in dwpose_rlt:
+                if frame_base_results and 'body_lmk_rlt' in frame_base_results:
+                    body_lmk_rlt = frame_base_results['body_lmk_rlt']
+                    if 'keypoints' in body_lmk_rlt:
                         # Scale keypoints to body_resized size
                         scale_x = cell_width / body_img.shape[1]
                         scale_y = body_height / body_img.shape[0]
-                        body_kps = dwpose_rlt['keypoints'].copy()
+                        body_kps = body_lmk_rlt['keypoints'].copy()
                         body_kps[:, 0] *= scale_x
                         body_kps[:, 1] *= scale_y
                         body_resized = draw_landmarks(body_kps, body_resized, color=(0, 255, 0), radius=1)

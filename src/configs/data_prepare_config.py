@@ -12,6 +12,9 @@ class DataPreparationConfig(PrintableConfig):
     kp70_cfg_path:    str = 'src/configs/model_configs/lmk70_onnx_config.yaml'
     matting_cfg_path: str = 'src/configs/model_configs/matting_config.yaml'
     pixie_cfg_path:   str = 'src/configs/model_configs/pixie_config.yaml'
+    sapiens_cfg_path: str = 'src/configs/model_configs/sapiens_config.yaml'
+
+    body_landmark_type: str = 'sapiens'  # 'sapiens' or 'dwpose'
 
     kp203_path:       str = 'pretrained/lmk106/landmark.onnx'
     fan_path:         str = 'pretrained/fan/fan_lmk_detector.onnx'
