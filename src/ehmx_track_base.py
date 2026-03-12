@@ -6,6 +6,7 @@ import cv2
 import torch
 import numpy as np
 from PIL import Image as PILImage
+from tqdm import tqdm
 
 from .utils.io import load_config
 from .utils.helper import load_onnx_model, instantiate_from_config, image2tensor
@@ -14,6 +15,90 @@ from .utils.landmark_runner import LandmarkRunner
 from .modules.smplx.utils import orginaze_body_pose
 from .modules.renderer.util import cam2persp_cam_fov, cam2persp_cam_fov_body
 from .configs.data_prepare_config import DataPreparationConfig
+
+
+def bbox_from_keypoints(kps, scores=None, vis_threshold=0.3, padding=0.0):
+    """Compute bounding box from keypoints, filtering by visibility score.
+
+    Args:
+        kps: (N, 2) keypoints array
+        scores: (N,) confidence scores, optional
+        vis_threshold: minimum score to consider a keypoint valid
+        padding: fractional padding to add around bbox (e.g. 0.1 = 10%)
+
+    Returns:
+        bbox: (4,) array [x1, y1, x2, y2] or None if no valid keypoints
+    """
+    if scores is not None:
+        valid = scores >= vis_threshold
+    else:
+        # Filter out -1 keypoints (Sapiens convention for invisible)
+        valid = np.all(kps > 0, axis=1)
+
+    valid_kps = kps[valid]
+    if len(valid_kps) < 2:
+        return None
+
+    x1, y1 = valid_kps.min(axis=0)
+    x2, y2 = valid_kps.max(axis=0)
+
+    if padding > 0:
+        w, h = x2 - x1, y2 - y1
+        x1 -= w * padding
+        y1 -= h * padding
+        x2 += w * padding
+        y2 += h * padding
+
+    return np.array([x1, y1, x2, y2], dtype=np.float32)
+
+
+def smooth_bboxes(bboxes_list, alpha=0.5):
+    """Temporally smooth a list of bboxes using exponential moving average.
+
+    Args:
+        bboxes_list: list of (4,) arrays or None entries
+        alpha: smoothing factor (0=no smoothing, 1=no memory). 0.5 is moderate.
+
+    Returns:
+        list of smoothed (4,) arrays (None entries are interpolated from neighbors)
+    """
+    n = len(bboxes_list)
+    if n == 0:
+        return bboxes_list
+
+    # Forward fill None entries from nearest valid neighbor
+    smoothed = [None] * n
+
+    # First: find valid bboxes
+    valid_indices = [i for i, b in enumerate(bboxes_list) if b is not None]
+    if len(valid_indices) == 0:
+        return bboxes_list
+
+    # Fill None entries with nearest valid bbox
+    filled = list(bboxes_list)
+    for i in range(n):
+        if filled[i] is None:
+            # Find nearest valid
+            dists = [abs(i - vi) for vi in valid_indices]
+            nearest = valid_indices[np.argmin(dists)]
+            filled[i] = filled[nearest].copy()
+
+    # Apply EMA forward pass
+    smoothed[0] = filled[0].copy()
+    for i in range(1, n):
+        smoothed[i] = alpha * filled[i] + (1 - alpha) * smoothed[i - 1]
+
+    # Backward pass for bidirectional smoothing
+    backward = [None] * n
+    backward[-1] = filled[-1].copy()
+    for i in range(n - 2, -1, -1):
+        backward[i] = alpha * filled[i] + (1 - alpha) * backward[i + 1]
+
+    # Average forward and backward
+    for i in range(n):
+        smoothed[i] = (smoothed[i] + backward[i]) / 2.0
+
+    return smoothed
 
 
 def load_image(image_path):
@@ -115,7 +200,24 @@ class TrackBasePipeline:
         self.mp_detector = instantiate_from_config(load_config(self.cfg.mp_cfg_path))
         self.mp_detector.warmup()
         
-        self.teaser_encoder = load_onnx_model(load_config(self.cfg.teaser_cfg_path))
+        # FLAME initialization: teaser (default) or pixel3dmm
+        if self.cfg.flame_init_method == 'pixel3dmm':
+            from .modules.pixel3dmm import Pixel3DMMInitializer
+            self.pixel3dmm_encoder = Pixel3DMMInitializer(
+                assets_dir=self.cfg.pixel3dmm_assets_dir,
+                flame_assets_dir=self.cfg.pixel3dmm_flame_assets_dir,
+                network_ckpt_path=self.cfg.pixel3dmm_ckpt_path,
+                device=self.device,
+            )
+            self.teaser_encoder = None
+        else:
+            self.teaser_encoder = load_onnx_model(load_config(self.cfg.teaser_cfg_path))
+            self.pixel3dmm_encoder = None
+
+        # Load FLAME model for vertex projection (needed for _projected_verts_2d with TEASER)
+        from .modules.flame.FLAME import FLAME
+        self.flame_model = FLAME(self.cfg.flame_assets_dir).to(self.device)
+        self.flame_model.eval()
         self.hamer_encoder = load_onnx_model(load_config(self.cfg.hamer_cfg_path))
         
         self.landmark_runner = LandmarkRunner(
@@ -284,15 +386,26 @@ class TrackBasePipeline:
             })
         
         # Extract FLAME parameters
-        cropped_image = cv2.resize(
-            crop_info['img_crop'], 
-            (self.cfg.teaser_input_size, self.cfg.teaser_input_size)
-        )
-        cropped_image = np.transpose(cropped_image, (2, 0, 1))[None, ...] / 255.0
-        coeff_param = self.teaser_encoder(cropped_image.astype(np.float32))
-        coeff_param['camera_RT_params'] = self.cvt_cam_to_persp_cam_fov(
-            torch.from_numpy(coeff_param['cam'])
-        ).numpy()
+        if self.teaser_encoder is not None:
+            # TEASER: feed-forward prediction (fast, good orientation)
+            cropped_image = cv2.resize(
+                crop_info['img_crop'],
+                (self.cfg.teaser_input_size, self.cfg.teaser_input_size)
+            )
+            cropped_image = np.transpose(cropped_image, (2, 0, 1))[None, ...] / 255.0
+            coeff_param = self.teaser_encoder(cropped_image.astype(np.float32))
+            coeff_param['camera_RT_params'] = self.cvt_cam_to_persp_cam_fov(
+                torch.from_numpy(coeff_param['cam'])
+            ).numpy()
+            coeff_param['_projected_verts_2d'] = self.project_flame_to_crop_teaser(
+                coeff_param, crop_size=self.cfg.head_crop_size)
+        elif self.pixel3dmm_encoder is not None:
+            # pixel3dmm: iterative optimization
+            lmk_for_p3dmm = lmk70[:68] if (lmk70 is not None and len(lmk70) >= 68) else None
+            coeff_param = self.pixel3dmm_encoder(crop_info['img_crop'], landmarks_2d=lmk_for_p3dmm)
+            coeff_param['camera_RT_params'] = self.cvt_cam_to_persp_cam_fov(
+                torch.from_numpy(coeff_param['cam'])
+            ).numpy()
         base_results['flame_coeffs'] = coeff_param
         mean_shape_results['flame_shape'] = coeff_param['shape_params']
         
@@ -341,7 +454,420 @@ class TrackBasePipeline:
         mean_shape_results['right_mano_shape'] = coeff_param['betas']
         
         return ret_images, base_results, mean_shape_results
-    
+
+    def track_base_video(self, frames_data, bbox_smooth_alpha=0.5, verbose=False):
+        """Process a video with temporally smoothed face/hand bboxes.
+
+        Two-pass approach:
+          Pass 1: Run Sapiens + body encoder on all frames, collect raw face/hand bboxes
+          Pass 2: Smooth bboxes temporally, then crop and run face/hand encoders
+
+        Args:
+            frames_data: list of dicts with keys:
+                'frame_key': str
+                'img_rgb': (H, W, 3) uint8 RGB image
+                'skip_face': bool
+                'skip_hands': bool
+            bbox_smooth_alpha: EMA alpha for bbox smoothing (0.5 = moderate)
+
+        Returns:
+            all_results: dict mapping frame_key -> (ret_images, base_results, mean_shape_results)
+        """
+        n = len(frames_data)
+
+        # === Pass 1: Sapiens detection + body encoding + raw bbox collection ===
+        print(f"  Pass 1: Detecting keypoints and body params ({n} frames)...")
+        pass1_data = []  # stores per-frame intermediate data
+        raw_face_bboxes = []
+        raw_lhand_bboxes = []
+        raw_rhand_bboxes = []
+
+        for fd in tqdm(frames_data, desc="  Pass 1 (Sapiens+body)"):
+            img_rgb = fd['img_rgb']
+            skip_face = fd['skip_face']
+            skip_hands = fd['skip_hands']
+
+            ret_images = {'ori_image': img_rgb}
+            base_results = {}
+            mean_shape_results = {}
+
+            # Detect body pose and keypoints
+            det_info, det_raw_info = self.body_lmk_detector(img_rgb)
+
+            # Use full image as bbox (no_body_crop mode)
+            h, w = img_rgb.shape[:2]
+            det_info['bbox'] = np.array([0, 0, w, h], dtype=np.float32)
+
+            # Crop body region
+            crop_info_hd = crop_image_by_bbox(
+                img_rgb, det_info['bbox'],
+                dsize=self.cfg.body_hd_size, scale=1.0
+            )
+            crop_info = crop_image_by_bbox(
+                img_rgb, det_info['bbox'],
+                dsize=self.cfg.body_crop_size, scale=1.0
+            )
+
+            base_results['body_crop'] = {
+                'M_o2c': crop_info['M_o2c'],
+                'M_c2o': crop_info['M_c2o'],
+                'M_o2c-hd': crop_info_hd['M_o2c'],
+                'M_c2o-hd': crop_info_hd['M_c2o']
+            }
+
+            body_lmk_rlt = {
+                'keypoints': _transform_pts(det_raw_info['keypoints'], crop_info_hd['M_o2c']),
+                'scores': det_raw_info['scores'],
+                'faces': det_info['faces'],
+                'hands': det_info['hands'],
+                'format': self.body_landmark_type,
+            }
+            base_results['body_lmk_rlt'] = body_lmk_rlt
+            base_results['dwpose_raw'] = det_raw_info
+            base_results['dwpose_rlt'] = body_lmk_rlt
+
+            # Hand validity — always compute from Sapiens scores
+            base_results['left_hand_valid'] = (
+                body_lmk_rlt['scores'][-42:-21].mean() >= self.cfg.check_hand_score
+            )
+            base_results['right_hand_valid'] = (
+                body_lmk_rlt['scores'][-21:].mean() >= self.cfg.check_hand_score
+            )
+
+            # Check crossing hands
+            if ((body_lmk_rlt['keypoints'][-42:-21] -
+                 body_lmk_rlt['keypoints'][-21:])**2).mean() < self.cfg.check_hand_dist:
+                base_results['left_hand_valid'] = False
+                base_results['right_hand_valid'] = False
+
+            # Body image and PIXIE body params
+            img_crop_body = crop_info['img_crop']
+            img_hd = crop_info_hd['img_crop']
+            ret_images['body_image'] = img_hd
+
+            img_crop_t = image2tensor(img_crop_body).to(self.device).unsqueeze(0)
+            img_hd_t = image2tensor(img_hd).to(self.device).unsqueeze(0)
+            img_crop_t = torch.nn.functional.interpolate(img_hd_t, (224, 224))
+
+            coeff_param = self.pixie_encoder(img_crop_t, img_hd_t)['body']
+            coeff_param = orginaze_body_pose(coeff_param)
+            coeff_param['camera_RT_params'] = self.cvt_cam_to_persp_cam_fov_body(coeff_param['body_cam'])
+            coeff_param = {k: v.cpu().numpy() for k, v in coeff_param.items()}
+            base_results['smplx_coeffs'] = coeff_param
+            mean_shape_results['smplx_shape'] = coeff_param['shape']
+
+            # Compute square head bbox from body-level keypoints (robust to back-facing)
+            # Indices: 0=nose, 1=l_eye, 2=r_eye, 3=l_ear, 4=r_ear, 5=l_shoulder, 6=r_shoulder
+            HEAD_KP_INDICES = [0, 1, 2, 3, 4]
+            SHOULDER_INDICES = [5, 6]
+            head_kps = det_raw_info['keypoints'][HEAD_KP_INDICES]
+            head_scores = det_raw_info['scores'][HEAD_KP_INDICES]
+            shoulder_kps = det_raw_info['keypoints'][SHOULDER_INDICES]
+            shoulder_scores = det_raw_info['scores'][SHOULDER_INDICES]
+
+            # Always compute face bbox from body-level keypoints (even for pshuman)
+            face_bbox = None
+            valid_head = head_scores >= 0.3
+            valid_head_kps = head_kps[valid_head]
+
+            if len(valid_head_kps) >= 2:
+                center = valid_head_kps.mean(axis=0)
+
+                # Estimate head size from ear-to-ear or keypoint span
+                ear_valid = head_scores[3] >= 0.3 and head_scores[4] >= 0.3
+                if ear_valid:
+                    head_width = np.linalg.norm(head_kps[3] - head_kps[4])
+                else:
+                    head_width = max(
+                        valid_head_kps[:, 0].max() - valid_head_kps[:, 0].min(),
+                        valid_head_kps[:, 1].max() - valid_head_kps[:, 1].min()
+                    )
+
+                head_size = head_width * 1.3
+                head_size = max(head_size, 50)
+
+                face_bbox = np.array([
+                    center[0] - head_size / 2,
+                    center[1] - head_size / 2,
+                    center[0] + head_size / 2,
+                    center[1] + head_size / 2,
+                ], dtype=np.float32)
+
+            elif np.sum(shoulder_scores >= 0.3) >= 2:
+                valid_sh = shoulder_kps[shoulder_scores >= 0.3]
+                sh_center = valid_sh.mean(axis=0)
+                sh_width = np.linalg.norm(valid_sh[0] - valid_sh[1])
+                head_size = sh_width * 0.7
+                head_center = sh_center - np.array([0, head_size * 1.0])
+                face_bbox = np.array([
+                    head_center[0] - head_size / 2,
+                    head_center[1] - head_size / 2,
+                    head_center[0] + head_size / 2,
+                    head_center[1] + head_size / 2,
+                ], dtype=np.float32)
+
+            raw_face_bboxes.append(face_bbox)
+
+            # Compute hand bboxes from Sapiens hand keypoints
+            from .modules.sapiens import LHAND_INDICES, RHAND_INDICES
+            lhand_kps = det_raw_info['keypoints'][LHAND_INDICES]
+            rhand_kps = det_raw_info['keypoints'][RHAND_INDICES]
+            lhand_scores = det_raw_info['scores'][LHAND_INDICES]
+            rhand_scores = det_raw_info['scores'][RHAND_INDICES]
+
+            # Always compute hand bboxes from Sapiens (even for pshuman)
+            lhand_bbox = bbox_from_keypoints(lhand_kps, lhand_scores, vis_threshold=0.3, padding=0.3)
+            rhand_bbox = bbox_from_keypoints(rhand_kps, rhand_scores, vis_threshold=0.3, padding=0.3)
+            raw_lhand_bboxes.append(lhand_bbox)
+            raw_rhand_bboxes.append(rhand_bbox)
+
+            pass1_data.append({
+                'img_rgb': img_rgb,
+                'ret_images': ret_images,
+                'base_results': base_results,
+                'mean_shape_results': mean_shape_results,
+                'det_info': det_info,
+                'det_raw_info': det_raw_info,
+                'skip_face': skip_face,
+                'skip_hands': skip_hands,
+            })
+
+        # === Smooth bboxes temporally (standard frames only, pshuman keeps per-frame) ===
+        print(f"  Smoothing bboxes (alpha={bbox_smooth_alpha})...")
+        # Separate standard vs pshuman indices
+        std_indices = [i for i in range(n) if not frames_data[i].get('skip_face', False)]
+        psh_indices = [i for i in range(n) if frames_data[i].get('skip_face', False)]
+
+        # Smooth only standard frame bboxes
+        std_face = [raw_face_bboxes[i] for i in std_indices]
+        std_lhand = [raw_lhand_bboxes[i] for i in std_indices]
+        std_rhand = [raw_rhand_bboxes[i] for i in std_indices]
+
+        smooth_std_face = smooth_bboxes(std_face, alpha=bbox_smooth_alpha)
+        smooth_std_lhand = smooth_bboxes(std_lhand, alpha=bbox_smooth_alpha)
+        smooth_std_rhand = smooth_bboxes(std_rhand, alpha=bbox_smooth_alpha)
+
+        # Build final smoothed arrays: smoothed for standard, raw for pshuman
+        smooth_face = [None] * n
+        smooth_lhand = [None] * n
+        smooth_rhand = [None] * n
+        for j, i in enumerate(std_indices):
+            smooth_face[i] = smooth_std_face[j]
+            smooth_lhand[i] = smooth_std_lhand[j]
+            smooth_rhand[i] = smooth_std_rhand[j]
+        for i in psh_indices:
+            smooth_face[i] = raw_face_bboxes[i]  # per-frame, no smoothing
+            smooth_lhand[i] = raw_lhand_bboxes[i]
+            smooth_rhand[i] = raw_rhand_bboxes[i]
+
+        # === Pass 2: Crop faces, run pixel3dmm (video track for std, per-frame for pshuman) ===
+        print(f"  Pass 2: Face/hand crops + encoders ({n} frames)...")
+
+        # Step 2a: Crop all faces first
+        face_crop_infos = []
+        for i, fd in enumerate(pass1_data):
+            img_rgb = fd['img_rgb']
+            det_info = fd['det_info']
+            face_bbox = smooth_face[i]
+            if face_bbox is not None:
+                crop_info = crop_image_by_bbox(
+                    img_rgb, face_bbox,
+                    dsize=self.cfg.head_crop_size, scale=1.2
+                )
+            else:
+                crop_info = crop_image(
+                    img_rgb, det_info['faces'],
+                    dsize=self.cfg.head_crop_size, scale=1.75
+                )
+            face_crop_infos.append(crop_info)
+
+        # Step 2b: Detect landmarks, then run pixel3dmm per-frame for all crops
+        flame_coeffs_list = [None] * n
+        if self.pixel3dmm_encoder is not None:
+            all_crops = [face_crop_infos[i]['img_crop'] for i in range(n)]
+            # Detect 68 face landmarks for each crop (used to constrain pixel3dmm optimization)
+            all_landmarks = []
+            for i in range(n):
+                t_img = all_crops[i].transpose((2, 0, 1)).astype(np.float32)
+                lmk70 = self.lmk70_detector.run(t_img[None] / 255.)['pts'] * 2  # (70, 2) in 512 coords
+                all_landmarks.append(lmk70[:68])  # take first 68 (iBUG format)
+            print(f"  Running pixel3dmm per-frame on {n} frames (with landmark constraint)...")
+            for i in range(n):
+                flame_coeffs_list[i] = self.pixel3dmm_encoder(all_crops[i], landmarks_2d=all_landmarks[i])
+
+        # Step 2c: Process each frame — landmarks, flame params, hand crops
+        all_results = {}
+
+        for i, fd in enumerate(tqdm(pass1_data, desc="  Pass 2 (face+hands)")):
+            img_rgb = fd['img_rgb']
+            ret_images = fd['ret_images']
+            base_results = fd['base_results']
+            mean_shape_results = fd['mean_shape_results']
+            skip_face = fd['skip_face']
+            det_info = fd['det_info']
+
+            frame_key = frames_data[i]['frame_key']
+            crop_info = face_crop_infos[i]
+
+            base_results['head_crop'] = {
+                'M_o2c': crop_info['M_o2c'], 'M_c2o': crop_info['M_c2o']
+            }
+            ret_images['head_image'] = crop_info['img_crop']
+
+            # Save verbose debug info
+            if verbose:
+                det_raw_info = fd['det_raw_info']
+                base_results['_debug'] = {
+                    'sapiens_keypoints': det_raw_info['keypoints'].copy(),
+                    'sapiens_scores': det_raw_info['scores'].copy(),
+                    'raw_face_bbox': raw_face_bboxes[i].copy() if raw_face_bboxes[i] is not None else None,
+                    'smooth_face_bbox': smooth_face[i].copy() if smooth_face[i] is not None else None,
+                    'raw_lhand_bbox': raw_lhand_bboxes[i].copy() if raw_lhand_bboxes[i] is not None else None,
+                    'smooth_lhand_bbox': smooth_lhand[i].copy() if smooth_lhand[i] is not None else None,
+                    'raw_rhand_bbox': raw_rhand_bboxes[i].copy() if raw_rhand_bboxes[i] is not None else None,
+                    'smooth_rhand_bbox': smooth_rhand[i].copy() if smooth_rhand[i] is not None else None,
+                    'used_bbox_crop': smooth_face[i] is not None,
+                }
+
+            # Detect face landmarks (only meaningful for front-facing)
+            lmk203 = self.landmark_runner.run(crop_info['img_crop'])['pts']
+            t_img = crop_info['img_crop'].transpose((2, 0, 1)).astype(np.float32)
+            lmk70 = self.lmk70_detector.run(t_img[None] / 255.)['pts'] * 2
+            lmk_mp = self.mp_detector.run(crop_info['img_crop'])['pts']
+
+            if skip_face or lmk203 is None or lmk_mp is None or lmk70 is None:
+                base_results.update({
+                    'head_lmk_203': np.zeros((203, 2)),
+                    'head_lmk_70': np.zeros((70, 2)),
+                    'head_lmk_mp': np.zeros((478, 2)),
+                    'head_lmk_valid': False
+                })
+            else:
+                if len(lmk203.shape) == 3:
+                    lmk203 = lmk203[0]
+                if len(lmk70.shape) == 3:
+                    lmk70 = lmk70[0]
+                if len(lmk_mp.shape) == 3:
+                    lmk_mp = lmk_mp[0]
+                base_results.update({
+                    'head_lmk_203': lmk203,
+                    'head_lmk_70': lmk70,
+                    'head_lmk_mp': lmk_mp,
+                    'head_lmk_valid': True
+                })
+
+            # FLAME parameters
+            if self.teaser_encoder is not None:
+                # TEASER: feed-forward prediction (fast, good orientation)
+                cropped_image = cv2.resize(
+                    crop_info['img_crop'],
+                    (self.cfg.teaser_input_size, self.cfg.teaser_input_size)
+                )
+                cropped_image = np.transpose(cropped_image, (2, 0, 1))[None, ...] / 255.0
+                coeff_param = self.teaser_encoder(cropped_image.astype(np.float32))
+                coeff_param['camera_RT_params'] = self.cvt_cam_to_persp_cam_fov(
+                    torch.from_numpy(coeff_param['cam'])
+                ).numpy()
+                coeff_param['_projected_verts_2d'] = self.project_flame_to_crop_teaser(
+                    coeff_param, crop_size=self.cfg.head_crop_size)
+            elif flame_coeffs_list[i] is not None:
+                # pixel3dmm: iterative optimization (pre-computed above)
+                coeff_param = flame_coeffs_list[i]
+                coeff_param['camera_RT_params'] = self.cvt_cam_to_persp_cam_fov(
+                    torch.from_numpy(coeff_param['cam'])
+                ).numpy()
+            else:
+                raise RuntimeError("No FLAME encoder available")
+            base_results['flame_coeffs'] = coeff_param
+            mean_shape_results['flame_shape'] = coeff_param['shape_params']
+
+            # --- Hand crops using smoothed Sapiens bboxes ---
+            all_hands_kps = det_info['hands']
+            hand_kps_l = all_hands_kps[0]
+            hand_kps_r = all_hands_kps[1]
+            hand_crop_size = self.cfg.hand_crop_size
+
+            # Left hand
+            lhand_bbox = smooth_lhand[i]
+            if lhand_bbox is not None:
+                crop_info = crop_image_by_bbox(
+                    img_rgb, lhand_bbox, lmk=hand_kps_l,
+                    scale=1.2, dsize=hand_crop_size
+                )
+                ret_images['left_hand_image'] = crop_info['img_crop']
+
+                t_img = cv2.flip(crop_info['img_crop'], 1)  # left hand flipped for HAMER
+                cropped_image = np.transpose(t_img, (2, 0, 1))[None, ...] / 255.0
+                coeff_param = self.hamer_encoder(cropped_image.astype(np.float32))
+                coeff_param['camera_RT_params'] = self.cvt_cam_to_persp_cam_fov(
+                    torch.from_numpy(coeff_param['pred_cam'])
+                ).numpy()
+                coeff_param['_projected_verts_2d'] = self.project_mano_to_crop(
+                    coeff_param, is_left=True, crop_size=hand_crop_size)
+                base_results['left_mano_coeffs'] = coeff_param
+                base_results['left_hand_crop'] = {
+                    'M_o2c': crop_info['M_o2c'], 'M_c2o': crop_info['M_c2o']
+                }
+                base_results['left_hand_valid'] = True
+                mean_shape_results['left_mano_shape'] = coeff_param['betas']
+            else:
+                # No valid Sapiens hand keypoints — use blank crop
+                ret_images['left_hand_image'] = np.zeros((hand_crop_size, hand_crop_size, 3), dtype=np.uint8)
+                # Feed blank image through HAMER for default coefficients
+                blank = np.zeros((1, 3, hand_crop_size, hand_crop_size), dtype=np.float32)
+                coeff_param = self.hamer_encoder(blank)
+                coeff_param['camera_RT_params'] = self.cvt_cam_to_persp_cam_fov(
+                    torch.from_numpy(coeff_param['pred_cam'])
+                ).numpy()
+                base_results['left_mano_coeffs'] = coeff_param
+                base_results['left_hand_crop'] = {
+                    'M_o2c': np.eye(3, dtype=np.float32),
+                    'M_c2o': np.eye(3, dtype=np.float32)
+                }
+                base_results['left_hand_valid'] = False
+                mean_shape_results['left_mano_shape'] = coeff_param['betas']
+
+            # Right hand
+            rhand_bbox = smooth_rhand[i]
+            if rhand_bbox is not None:
+                crop_info = crop_image_by_bbox(
+                    img_rgb, rhand_bbox, lmk=hand_kps_r,
+                    scale=1.2, dsize=hand_crop_size
+                )
+                ret_images['right_hand_image'] = crop_info['img_crop']
+
+                cropped_image = np.transpose(crop_info['img_crop'], (2, 0, 1))[None, ...] / 255.0
+                coeff_param = self.hamer_encoder(cropped_image.astype(np.float32))
+                coeff_param['camera_RT_params'] = self.cvt_cam_to_persp_cam_fov(
+                    torch.from_numpy(coeff_param['pred_cam'])
+                ).numpy()
+                coeff_param['_projected_verts_2d'] = self.project_mano_to_crop(
+                    coeff_param, is_left=False, crop_size=hand_crop_size)
+                base_results['right_mano_coeffs'] = coeff_param
+                base_results['right_hand_crop'] = {
+                    'M_o2c': crop_info['M_o2c'], 'M_c2o': crop_info['M_c2o']
+                }
+                base_results['right_hand_valid'] = True
+                mean_shape_results['right_mano_shape'] = coeff_param['betas']
+            else:
+                ret_images['right_hand_image'] = np.zeros((hand_crop_size, hand_crop_size, 3), dtype=np.uint8)
+                blank = np.zeros((1, 3, hand_crop_size, hand_crop_size), dtype=np.float32)
+                coeff_param = self.hamer_encoder(blank)
+                coeff_param['camera_RT_params'] = self.cvt_cam_to_persp_cam_fov(
+                    torch.from_numpy(coeff_param['pred_cam'])
+                ).numpy()
+                base_results['right_mano_coeffs'] = coeff_param
+                base_results['right_hand_crop'] = {
+                    'M_o2c': np.eye(3, dtype=np.float32),
+                    'M_c2o': np.eye(3, dtype=np.float32)
+                }
+                base_results['right_hand_valid'] = False
+                mean_shape_results['right_mano_shape'] = coeff_param['betas']
+
+            all_results[frame_key] = (ret_images, base_results, mean_shape_results)
+
+        return all_results
+
     def crop_face_and_hands(self, img_rgb, base_results):
         """
         Crop face and hand regions from original image using saved transformation matrices.
@@ -389,15 +915,122 @@ class TrackBasePipeline:
         
         return ret_images
     
+    def project_mano_to_crop(self, mano_coeffs, is_left=False, crop_size=512):
+        """Project MANO hand vertices to 2D crop coordinates.
+
+        Uses HAMER's perspective camera (pred_cam_t, focal_length) to project
+        MANO vertices directly into the hand crop's pixel space.
+
+        Args:
+            mano_coeffs: dict from hamer_encoder with global_orient, hand_pose, betas,
+                         pred_cam_t, focal_length
+            is_left: whether this is the left hand (was flipped before HAMER)
+            crop_size: size of the hand crop image
+
+        Returns:
+            (N, 2) numpy array of 2D vertex positions in crop space, or None on failure
+        """
+        from .modules.mano import MANO
+        from .utils import rotation_converter as converter
+
+        if not hasattr(self, 'mano'):
+            mano_assets_dir = os.path.join(os.path.dirname(__file__), '../assets/MANO')
+            self.mano = MANO(mano_assets_dir).to(self.device)
+
+        # Parse MANO coefficients
+        coeffs = {}
+        for k, v in mano_coeffs.items():
+            if not isinstance(v, np.ndarray):
+                continue
+            v_tensor = torch.from_numpy(v).float().to(self.device)
+            if k == 'global_orient':
+                b, n = v_tensor.shape[:2]
+                v_tensor = converter.batch_matrix2axis(v_tensor.flatten(0, 1)).reshape(b, n, 3)
+            elif k == 'hand_pose':
+                b, n = v_tensor.shape[:2]
+                v_tensor = converter.batch_matrix2axis(v_tensor.flatten(0, 1)).reshape(b, n, 3)
+            else:
+                if v_tensor.ndim == 1:
+                    v_tensor = v_tensor.unsqueeze(0)
+                elif v_tensor.ndim == 2 and v_tensor.shape[0] != 1:
+                    v_tensor = v_tensor.unsqueeze(0)
+            coeffs[k] = v_tensor
+
+        # Forward MANO
+        hand_ret = self.mano(coeffs, pose_type='aa')
+        verts = hand_ret['vertices']  # (1, 778, 3)
+
+        # Perspective projection using HAMER camera
+        pred_cam_t = coeffs['pred_cam_t']  # (1, 3) — 3D translation
+        focal = coeffs['focal_length']  # (1, 2) — [fx, fy], typically [5000, 5000]
+
+        # HAMER internally uses render_res=256 for pred_cam_t computation
+        # (verified: 2*5000/(tz*s) = 256). Project at render_res then scale to crop_size.
+        render_res = 256
+        cam_t = pred_cam_t.unsqueeze(1)  # (1, 1, 3)
+        verts_cam = verts + cam_t  # translate vertices
+        # Project at HAMER's internal render_res
+        x = focal[0, 0] * verts_cam[:, :, 0] / verts_cam[:, :, 2] + render_res / 2
+        y = focal[0, 1] * verts_cam[:, :, 1] / verts_cam[:, :, 2] + render_res / 2
+        # Scale from render_res to crop_size
+        scale_factor = crop_size / render_res
+        x = x * scale_factor
+        y = y * scale_factor
+
+        pts_2d = torch.stack([x, y], dim=-1)[0].cpu().numpy()  # (778, 2)
+
+        # Left hand was flipped before HAMER, so flip the projection back
+        if is_left:
+            pts_2d[:, 0] = crop_size - 1 - pts_2d[:, 0]
+
+        return pts_2d
+
+    def project_flame_to_crop_teaser(self, flame_coeffs, crop_size=512):
+        """
+        Project FLAME vertices to 2D crop coordinates using TEASER's weak perspective camera.
+        Uses the analytical GS_Camera projection: cam=[s,tx,ty] → pixel coords.
+
+        Returns (N, 2) numpy array of 2D vertex positions in crop_size x crop_size space.
+        """
+        # Build param dict for FLAME forward
+        param_dict = {}
+        for k in ['shape_params', 'expression_params', 'pose_params', 'jaw_params', 'eyelid_params']:
+            if k in flame_coeffs:
+                v = flame_coeffs[k]
+                if isinstance(v, np.ndarray):
+                    v = torch.from_numpy(v).float().to(self.device)
+                if v.ndim == 1:
+                    v = v.unsqueeze(0)
+                param_dict[k] = v
+
+        with torch.no_grad():
+            ret_dict = self.flame_model(param_dict)
+        verts = ret_dict['vertices'][0].cpu().numpy()  # (5023, 3)
+
+        # TEASER cam = [s, tx, ty]
+        cam = flame_coeffs['cam']
+        if isinstance(cam, np.ndarray):
+            cam = cam.flatten()
+        s, tx, ty = float(cam[0]), float(cam[1]), float(cam[2])
+
+        # Analytical GS_Camera projection (derived from cam2persp_cam_fov + GS_Camera pipeline):
+        # x_pixel = crop_size/2 * (1 + s * (Vx + tx))
+        # y_pixel = crop_size/2 * (1 - s * (Vy + ty))
+        half = crop_size / 2.0
+        x = half * (1.0 + s * (verts[:, 0] + tx))
+        y = half * (1.0 - s * (verts[:, 1] + ty))
+
+        return np.stack([x, y], axis=-1)
+
     def prepare_ref_vertices(self, base_results, img_size=512):
         """
         Compute dense FLAME and MANO vertices from saved coefficients.
         Matches prepare_ref_vertices in ehm_refiner.py.
-        
+
         Args:
             base_results: Base tracking results containing coefficients and crop info
             img_size: Image size for coordinate transformation (default 512)
-            
+
         Returns:
             Tuple of (ref_head_vertices, ref_hand_l_vertices, ref_hand_r_vertices)
             All vertices are in body_hd (body crop high-res) coordinates, with shape (1, N, 3)
@@ -549,7 +1182,99 @@ class TrackBasePipeline:
         ref_hand_r_vertices[..., 2] = ref_hand_r_vertices[..., 2] - ref_hand_r_joints[:, 0:1, 2]
         
         return ref_head_vertices, ref_hand_l_vertices, ref_hand_r_vertices
-    
+
+    def prepare_ref_vertices_for_vis(self, base_results, img_size=512):
+        """
+        Compute FLAME/MANO vertices in each crop's own coordinate space (for visualization).
+        Unlike prepare_ref_vertices which outputs body_hd coordinates, this keeps vertices
+        in head_crop / hand_crop 512x512 space.
+        """
+        from .modules.flame import FLAME
+        from .modules.mano import MANO
+        from .modules.renderer.head_renderer import Renderer as HeadRenderer
+        from .modules.renderer.hand_renderer import Renderer as HandRenderer
+        from .utils import rotation_converter as converter
+
+        if not hasattr(self, 'flame'):
+            flame_assets_dir = os.path.join(os.path.dirname(__file__), '../assets/FLAME')
+            self.flame = FLAME(flame_assets_dir).to(self.device)
+            self.head_renderer = HeadRenderer(flame_assets_dir, img_size, focal_length=1.0/12).to(self.device)
+
+        if not hasattr(self, 'mano'):
+            mano_assets_dir = os.path.join(os.path.dirname(__file__), '../assets/MANO')
+            self.mano = MANO(mano_assets_dir).to(self.device)
+            self.hand_renderer = HandRenderer(mano_assets_dir, img_size, focal_length=1.0/12).to(self.device)
+
+        # === Head (in head_crop 512x512 space) ===
+        flame_coeffs = {}
+        for k, v in base_results['flame_coeffs'].items():
+            if isinstance(v, np.ndarray):
+                v_tensor = torch.from_numpy(v).float().to(self.device)
+                if v_tensor.ndim == 1:
+                    v_tensor = v_tensor.unsqueeze(0)
+                elif v_tensor.ndim == 2 and v_tensor.shape[0] != 1:
+                    v_tensor = v_tensor.unsqueeze(0)
+                flame_coeffs[k] = v_tensor
+            else:
+                flame_coeffs[k] = v
+
+        head_ret_dict = self.flame(flame_coeffs)
+        render_rlt = self.head_renderer(
+            head_ret_dict['vertices'],
+            transform_matrix=flame_coeffs['camera_RT_params'],
+            landmarks={'joints': head_ret_dict['joints']},
+            ret_image=False
+        )
+        # No body_hd transform — keep in crop space
+        ref_head_vertices = render_rlt[0][:, np.unique(self.flame.head_index)]
+
+        # === Left hand (in left_hand_crop space) ===
+        def _parse_mano(mano_coeffs_raw):
+            coeffs = {}
+            for k, v in mano_coeffs_raw.items():
+                if isinstance(v, np.ndarray):
+                    v_tensor = torch.from_numpy(v).float().to(self.device)
+                    if k == 'global_orient':
+                        b, n = v_tensor.shape[:2]
+                        v_tensor = converter.batch_matrix2axis(v_tensor.flatten(0, 1)).reshape(b, n, 3)
+                    elif k == 'hand_pose':
+                        b, n = v_tensor.shape[:2]
+                        v_tensor = converter.batch_matrix2axis(v_tensor.flatten(0, 1)).reshape(b, n, 3)
+                    else:
+                        if v_tensor.ndim == 1:
+                            v_tensor = v_tensor.unsqueeze(0)
+                        elif v_tensor.ndim == 2 and v_tensor.shape[0] != 1:
+                            v_tensor = v_tensor.unsqueeze(0)
+                    coeffs[k] = v_tensor
+                else:
+                    coeffs[k] = v
+            return coeffs
+
+        left_mano_coeffs = _parse_mano(base_results['left_mano_coeffs'])
+        hand_l_ret = self.mano(left_mano_coeffs, pose_type='aa')
+        render_l = self.hand_renderer(
+            hand_l_ret['vertices'],
+            landmarks={'joints': hand_l_ret['joints']},
+            is_left=True,
+            transform_matrix=left_mano_coeffs['camera_RT_params'],
+            ret_image=False
+        )
+        ref_hand_l_vertices = self._fix_mirror_issue(render_l[0], img_size)
+        ref_hand_l_vertices[..., 0] = img_size - 1 - ref_hand_l_vertices[..., 0]  # left hand mirror
+
+        right_mano_coeffs = _parse_mano(base_results['right_mano_coeffs'])
+        hand_r_ret = self.mano(right_mano_coeffs, pose_type='aa')
+        render_r = self.hand_renderer(
+            hand_r_ret['vertices'],
+            landmarks={'joints': hand_r_ret['joints']},
+            is_left=False,
+            transform_matrix=right_mano_coeffs['camera_RT_params'],
+            ret_image=False
+        )
+        ref_hand_r_vertices = self._fix_mirror_issue(render_r[0], img_size)
+
+        return ref_head_vertices, ref_hand_l_vertices, ref_hand_r_vertices
+
     def _transform_points3d(self, points3d, M):
         """Transform 3D points using transformation matrix."""
         R3d = torch.zeros_like(M)
@@ -703,47 +1428,26 @@ class TrackBasePipeline:
                 
                 grid[y_start:y_start+body_height, x_start:x_start+cell_width] = body_resized
             
-            # Compute dense vertices once for this frame
-            ref_head_vertices = None
-            ref_hand_l_vertices = None
-            ref_hand_r_vertices = None
-            
-            if frame_base_results:
-                try:
-                    # Check if all required data exists
-                    has_flame = 'flame_coeffs' in frame_base_results and 'head_crop' in frame_base_results
-                    has_left_hand = 'left_mano_coeffs' in frame_base_results and 'left_hand_crop' in frame_base_results
-                    has_right_hand = 'right_mano_coeffs' in frame_base_results and 'right_hand_crop' in frame_base_results
-                    
-                    if has_flame or has_left_hand or has_right_hand:
-                        ref_head_vertices, ref_hand_l_vertices, ref_hand_r_vertices = self.prepare_ref_vertices(frame_base_results)
-                except Exception as e:
-                    print(f"Warning: Failed to compute vertices for {frame_key}: {e}")
-                    pass
-            
             # Face image (128x128) with FLAME dense vertices
             face_img = ret_images.get('head_image')
             if face_img is not None:
                 face_resized = cv2.resize(face_img, (cell_width, face_height))
                 
                 # Draw FLAME vertices if available
-                if ref_head_vertices is not None and frame_base_results:
-                    try:
-                        # ref_head_vertices are already in body_hd coordinates
-                        # Just need to scale them to the resized face image dimensions
-                        head_verts_body = ref_head_vertices[0, :, :2].cpu().numpy()  # (N, 2) in body_hd coords
-                        
-                        # Scale from body_hd size to resized face dimensions
-                        body_hd_size = self.cfg.body_hd_size
-                        scale_x = cell_width / body_hd_size
-                        scale_y = face_height / body_hd_size
-                        head_verts_display = head_verts_body.copy()
+                # Draw projected FLAME vertices on face crop
+                try:
+                    if (frame_base_results and 'flame_coeffs' in frame_base_results
+                            and '_projected_verts_2d' in frame_base_results.get('flame_coeffs', {})):
+                        proj_verts = frame_base_results['flame_coeffs']['_projected_verts_2d']
+                        crop_size = 512
+                        scale_x = cell_width / crop_size
+                        scale_y = face_height / crop_size
+                        head_verts_display = proj_verts.copy()
                         head_verts_display[:, 0] *= scale_x
                         head_verts_display[:, 1] *= scale_y
-                        
                         face_resized = draw_landmarks(head_verts_display, face_resized, color=(255, 0, 255), radius=1)
-                    except Exception as e:
-                        pass
+                except Exception:
+                    pass
                 
                 y_face = y_start + body_height
                 grid[y_face:y_face+face_height, x_start:x_start+cell_width] = face_resized
@@ -758,24 +1462,20 @@ class TrackBasePipeline:
             if left_hand_img is not None:
                 left_resized = cv2.resize(left_hand_img, (hand_width, hand_height))
                 
-                # Draw left MANO vertices if available
-                if ref_hand_l_vertices is not None and frame_base_results:
-                    try:
-                        # ref_hand_l_vertices are already in body_hd coordinates
-                        # Just need to scale them to the resized hand image dimensions
-                        hand_verts_body = ref_hand_l_vertices[0, :, :2].cpu().numpy()  # (N, 2) in body_hd coords
-                        
-                        # Scale from body_hd size to resized hand dimensions
-                        body_hd_size = self.cfg.body_hd_size
-                        scale_x = hand_width / body_hd_size
-                        scale_y = hand_height / body_hd_size
-                        hand_verts_display = hand_verts_body.copy()
+                # Draw left MANO projected vertices
+                try:
+                    if (frame_base_results and 'left_mano_coeffs' in frame_base_results
+                            and '_projected_verts_2d' in frame_base_results.get('left_mano_coeffs', {})):
+                        proj_verts = frame_base_results['left_mano_coeffs']['_projected_verts_2d']
+                        crop_size = self.cfg.hand_crop_size
+                        scale_x = hand_width / crop_size
+                        scale_y = hand_height / crop_size
+                        hand_verts_display = proj_verts.copy()
                         hand_verts_display[:, 0] *= scale_x
                         hand_verts_display[:, 1] *= scale_y
-                        
                         left_resized = draw_landmarks(hand_verts_display, left_resized, color=(255, 0, 255), radius=1)
-                    except Exception as e:
-                        pass
+                except Exception:
+                    pass
                 
                 grid[y_hands:y_hands+hand_height, x_start:x_start+hand_width] = left_resized
             
@@ -783,24 +1483,20 @@ class TrackBasePipeline:
                 right_resized = cv2.resize(right_hand_img, (hand_width, hand_height))
                 x_right = x_start + hand_width
                 
-                # Draw right MANO vertices if available
-                if ref_hand_r_vertices is not None and frame_base_results:
-                    try:
-                        # ref_hand_r_vertices are already in body_hd coordinates
-                        # Just need to scale them to the resized hand image dimensions
-                        hand_verts_body = ref_hand_r_vertices[0, :, :2].cpu().numpy()  # (N, 2) in body_hd coords
-                        
-                        # Scale from body_hd size to resized hand dimensions
-                        body_hd_size = self.cfg.body_hd_size
-                        scale_x = hand_width / body_hd_size
-                        scale_y = hand_height / body_hd_size
-                        hand_verts_display = hand_verts_body.copy()
+                # Draw right MANO projected vertices
+                try:
+                    if (frame_base_results and 'right_mano_coeffs' in frame_base_results
+                            and '_projected_verts_2d' in frame_base_results.get('right_mano_coeffs', {})):
+                        proj_verts = frame_base_results['right_mano_coeffs']['_projected_verts_2d']
+                        crop_size = self.cfg.hand_crop_size
+                        scale_x = hand_width / crop_size
+                        scale_y = hand_height / crop_size
+                        hand_verts_display = proj_verts.copy()
                         hand_verts_display[:, 0] *= scale_x
                         hand_verts_display[:, 1] *= scale_y
-                        
                         right_resized = draw_landmarks(hand_verts_display, right_resized, color=(255, 0, 255), radius=1)
-                    except Exception as e:
-                        pass
+                except Exception:
+                    pass
                 
                 grid[y_hands:y_hands+hand_height, x_right:x_right+hand_width] = right_resized
             

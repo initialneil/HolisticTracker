@@ -6,7 +6,11 @@ from .base_config import PrintableConfig
 @dataclass(repr=False)  # use repr from PrintableConfig
 class DataPreparationConfig(PrintableConfig):
     mp_cfg_path:      str = 'src/configs/model_configs/mediapipe_detector.yaml'
+    flame_init_method: str = 'teaser'  # 'pixel3dmm' or 'teaser'
     teaser_cfg_path:   str = 'src/configs/model_configs/teaser_onnx_config.yaml'
+    pixel3dmm_assets_dir: str = 'assets/pixel3dmm'
+    pixel3dmm_flame_assets_dir: str = 'assets/pixel3dmm_flame'
+    pixel3dmm_ckpt_path: str = 'pretrained/pixel3dmm/uv.ckpt'
     hamer_cfg_path:   str = 'src/configs/model_configs/hamer_onnx_config.yaml'
     dwpose_cfg_path:  str = 'src/configs/model_configs/dwpose_onnx_config.yaml'
     kp70_cfg_path:    str = 'src/configs/model_configs/lmk70_onnx_config.yaml'
