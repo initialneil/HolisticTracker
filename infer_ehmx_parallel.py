@@ -75,7 +75,6 @@ def run_video_pipeline(video_name, json_path, args, gpu_id):
         '--images_dir', args.images_dir,
         '--index_json', json_path,
         '--ehmx_dir', args.ehmx_dir,
-        '--body_landmark_type', args.body_landmark_type,
     ]
     
     if args.mattes_dir:
@@ -109,11 +108,11 @@ def run_video_pipeline(video_name, json_path, args, gpu_id):
         print(f"[GPU {gpu_id}] [{video_name}] Step 1/3: Running track_base...")
         cmd_track_base = [
             sys.executable, 'infer_ehmx_track_base.py'
-        ] + common_args
-        
+        ] + common_args + ['--body_landmark_type', args.body_landmark_type]
+
         if overwrite_base:
             cmd_track_base.append('--overwrite')
-        
+
         if args.check_hand_score is not None:
             cmd_track_base.extend(['--check_hand_score', str(args.check_hand_score)])
         

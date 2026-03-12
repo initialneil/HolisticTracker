@@ -23,79 +23,84 @@ from src.configs.data_prepare_config import DataPreparationConfig
 
 def process_video(video_name, video_data, args, pipeline):
     """
-    Process all frames for a single video.
-    
+    Process all frames for a single video using video-level bbox smoothing.
+
     Args:
         video_name: Name of the video
         video_data: Dictionary with 'frames_num' and 'frames_keys'
         args: Command line arguments
         pipeline: TrackBasePipeline instance
-    
+
     Returns:
         Tuple of (base_results, id_share_params, ret_images_dict)
     """
     frames_keys = video_data['frames_keys']
     frames_num = video_data['frames_num']
-    
+
     print(f"\nProcessing video: {video_name}")
-    print(f"  Frames: {frames_num}")
-    
-    base_results = {}
-    id_share_params = {}
-    ret_images_dict = {}
-    
-    # Accumulators for identity-shared parameters
-    shape_accum = {
-        'smplx_shape': [],
-        'flame_shape': [],
-        'left_mano_shape': [],
-        'right_mano_shape': []
-    }
-    
-    valid_count = 0
-    
-    for frame_key in tqdm(frames_keys, desc=f"Processing {video_name}"):
-        # Load original image
+    print(f"  Frames: {frames_num} ({len(frames_keys)} with pshuman)")
+
+    # Load all images first
+    frames_data = []
+    for frame_key in frames_keys:
         img_rgb = load_frame_image(args.images_dir, video_name, frame_key, args.pshuman_dir)
-        
+
+        if img_rgb is None:
+            print(f"  Warning: Failed to load frame: {frame_key}")
+            continue
+
         # Apply matte if available
         if args.mattes_dir:
             matte_path = os.path.join(args.mattes_dir, video_name, f"{frame_key}.png")
             matte = load_matte(matte_path)
             if matte is not None:
                 img_rgb = apply_matte_to_image(img_rgb, matte)
-        
-        # Process frame
+
         skip_face = skip_hands = False
         if 'pshuman' in frame_key:
             skip_face = skip_hands = True
 
-        ret_images, frame_base_results, mean_shape_results = pipeline.track_base(
-            img_rgb, no_body_crop=True, skip_face=skip_face, skip_hands=skip_hands
-        )
-        
-        if ret_images is None or frame_base_results is None:
-            print(f"  Warning: Failed to process frame: {frame_key}")
-            continue
-        
-        # Store results
+        frames_data.append({
+            'frame_key': frame_key,
+            'img_rgb': img_rgb,
+            'skip_face': skip_face,
+            'skip_hands': skip_hands,
+        })
+
+    if len(frames_data) == 0:
+        print(f"  Warning: No frames loaded for {video_name}")
+        return {}, {}, {}
+
+    # Use video-level processing with bbox smoothing
+    all_results = pipeline.track_base_video(frames_data, bbox_smooth_alpha=0.5, verbose=getattr(args, 'verbose', False))
+
+    # Reorganize results
+    base_results = {}
+    id_share_params = {}
+    ret_images_dict = {}
+
+    shape_accum = {
+        'smplx_shape': [],
+        'flame_shape': [],
+        'left_mano_shape': [],
+        'right_mano_shape': []
+    }
+
+    for frame_key, (ret_images, frame_base_results, mean_shape_results) in all_results.items():
         base_results[frame_key] = frame_base_results
         ret_images_dict[frame_key] = ret_images
-        
-        # Accumulate shape parameters
+
         for key in shape_accum:
             if key in mean_shape_results:
                 shape_accum[key].append(mean_shape_results[key])
-        
-        valid_count += 1
-    
-    print(f"  Successfully processed {valid_count}/{frames_num} frames")
-    
+
+    print(f"  Successfully processed {len(base_results)}/{frames_num} frames")
+
     # Average shape parameters
     for key, values in shape_accum.items():
         if len(values) > 0:
             id_share_params[key] = np.mean(values, axis=0)
-    
+
     return base_results, id_share_params, ret_images_dict
 
 
@@ -127,11 +132,12 @@ def save_results(video_name, base_results, id_share_params, out_dir, info):
     print(f"  Saved base tracking to: {base_track_path}")
     print(f"  Saved id share params to: {id_share_path}")
     
-    # Save videos_info.json
+    # Save videos_info.json (preserve fps from input index)
     videos_info = {
         video_name: {
             'frames_num': len(base_results),
-            'frames_keys': sorted(base_results.keys())
+            'frames_keys': sorted(base_results.keys()),
+            'fps': info.get('fps', 24)
         }
     }
     videos_info_path = os.path.join(video_out_dir, 'videos_info.json')
@@ -193,7 +199,9 @@ def main():
                         help='Body landmark detector type (default: sapiens)')
     parser.add_argument('--overwrite', action='store_true',
                         help='Overwrite existing results')
-    
+    parser.add_argument('--verbose', action='store_true',
+                        help='Save debug info (sapiens kps, bboxes) into base_tracking.pkl')
+
     args = parser.parse_args()
     
     # Load index JSON
@@ -270,7 +278,8 @@ def main():
         info = {
             'images_dir': args.images_dir,
             'mattes_dir': args.mattes_dir,
-            'pshuman_dir': args.pshuman_dir
+            'pshuman_dir': args.pshuman_dir,
+            'fps': video_data.get('fps', 24)
         }
         save_results(video_name, base_results, id_share_params, args.ehmx_dir, info)
         

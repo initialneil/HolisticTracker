@@ -99,6 +99,11 @@ class RefineFlamePipeline(object):
         )
         
         self.saving_root = None
+
+        # NOTE: pixel3dmm refinement was tested but removed — it shifts FLAME params
+        # too far from TEASER init, causing landmark loss to start 10x higher (14426 vs 1103).
+        # The landmark optimizer can't fully recover, resulting in worse mesh alignment.
+        # TEASER init + landmark optimization alone gives better results.
     
     def build_cameras_kwargs(self, batch_size):
         """Build camera parameters for rendering."""
@@ -234,6 +239,8 @@ class RefineFlamePipeline(object):
         steps = opt_config['steps']
         params_config = opt_config['params']
         lambda_config = opt_config['lambda_config']
+        # Per-set landmark validity (fallback frames only have lmk_fan from Sapiens)
+        lmk_valid_per_set = opt_config.get('lmk_valid_per_set', {})
         
         batch_size = batch_flame['camera_RT_params'].shape[0]
         
@@ -278,19 +285,23 @@ class RefineFlamePipeline(object):
                 R = rotation_6d_to_matrix(param_dict['gl_R_6d'])
             
             for k in landmark_lst_dct.keys():
+                # Per-set validity mask (lmk_203/lmk_mp need MediaPipe, lmk_fan can use Sapiens fallback)
+                k_valid = lmk_valid_per_set.get(k, head_lmk_valid)
+                if k_valid.sum() == 0:
+                    continue
                 # Get landmark key for gaze optimization
                 lmk_key = k
                 if 'gaze_mode' in opt_config and opt_config['gaze_mode']:
                     t_gaze_landmarks, t_gaze_idx = opt_config['get_gaze_landmarks'](ret_dict)
                     t_lmk = cameras.transform_points_screen(t_gaze_landmarks[k], R=R, T=T)[..., :2]
-                    t_lmk = t_lmk[head_lmk_valid]
-                    g_lmk = landmark_lst_dct[k][head_lmk_valid][:, t_gaze_idx[k], :]
+                    t_lmk = t_lmk[k_valid]
+                    g_lmk = landmark_lst_dct[k][k_valid][:, t_gaze_idx[k], :]
                 else:
                     t_lmk = cameras.transform_points_screen(ret_dict[k], R=R, T=T)[..., :2]
-                    t_lmk = t_lmk[head_lmk_valid]
-                    g_lmk = landmark_lst_dct[k][head_lmk_valid]
-                
-                cam = batch_flame['cam'][head_lmk_valid]
+                    t_lmk = t_lmk[k_valid]
+                    g_lmk = landmark_lst_dct[k][k_valid]
+
+                cam = batch_flame['cam'][k_valid]
                 t_w = lambda_config.get('lambda_lmk_2d', 1.0) * 2 * 5
                 if '203' in k:
                     t_w = lambda_config.get('lambda_lmk_203', 1.0) * 10 * 5
@@ -388,7 +399,14 @@ class RefineFlamePipeline(object):
         
         landmark_lst_dct = dict(lmk_203=gt_lmk_203, lmk_fan=gt_lmk_fan, lmk_mp=gt_lmk_mp)
         head_lmk_valid = batch_base['head_lmk_valid']
-        
+        # Per-set validity: lmk_fan uses Sapiens (valid for most frames),
+        # lmk_203/lmk_mp use MediaPipe (only valid when MP detected the face)
+        lmk_valid_per_set = {
+            'lmk_203': batch_base.get('head_lmk_valid_mp', head_lmk_valid).clone(),
+            'lmk_fan': head_lmk_valid.clone(),
+            'lmk_mp': batch_base.get('head_lmk_valid_mp', head_lmk_valid).clone(),
+        }
+
         # Early return if no valid landmarks
         if head_lmk_valid.sum() == 0:
             print(f"Batch {batch_id}: No valid landmarks, skipping optimization")
@@ -464,8 +482,9 @@ class RefineFlamePipeline(object):
             'desc': 'Tuning FLAME params',
             'save_prefix': 'flame',
             'update_flame': lambda bf, pd, bs: self._update_flame_params(bf, pd, bs),
+            'lmk_valid_per_set': lmk_valid_per_set,
         }
-        
+
         # Run FLAME optimization
         param_dict = self._run_optimization_loop(
             flame_opt_config, batch_flame, g_flame_shape, cameras,
@@ -513,6 +532,7 @@ class RefineFlamePipeline(object):
             'gaze_mode': True,
             'get_gaze_landmarks': get_gaze_landmarks,
             'update_flame': lambda bf, pd, bs: bf.update({'eye_pose_params': pd['eye_pose_code'].expand(bs, -1)}),
+            'lmk_valid_per_set': lmk_valid_per_set,
         }
         
         log('Start tuning FLAME eyepose params')
@@ -734,9 +754,25 @@ class RefineFlamePipeline(object):
         batch_face_imgs = None
         if batch_imgs_dict is not None:
             batch_face_imgs = [batch_imgs_dict[key] for key in all_frame_keys if key in batch_imgs_dict]
-        
-        # Collate all frames
-        batch_flame_lmk = [tracked_rlt[key] for key in all_frame_keys]
+
+        # pixel3dmm refinement removed — see note in __init__
+
+        # Collate all frames (strip _debug and _projected_verts_2d which can't be collated)
+        _skip_keys = {'_debug', '_projected_verts_2d'}
+        def _clean_dict(d):
+            out = {}
+            for k, v in d.items():
+                if k in _skip_keys:
+                    continue
+                if isinstance(v, dict):
+                    out[k] = _clean_dict(v)
+                else:
+                    out[k] = v
+            return out
+
+        batch_flame_lmk = []
+        for key in all_frame_keys:
+            batch_flame_lmk.append(_clean_dict(tracked_rlt[key]))
 
         # special fix for dwpose_raw.bbox
         for idx, item in enumerate(batch_flame_lmk):
@@ -747,7 +783,35 @@ class RefineFlamePipeline(object):
 
         batch_flame_lmk = torch.utils.data.default_collate(batch_flame_lmk)
         batch_flame_lmk = data_to_device(batch_flame_lmk, device=self.device)
-        
+
+        # Use Sapiens face landmarks for ALL frames in lmk_fan (more robust than MediaPipe 70-pt)
+        # Also enables FLAME optimization for frames where MediaPipe failed entirely
+        batch_flame_lmk['head_lmk_valid_mp'] = batch_flame_lmk['head_lmk_valid'].clone()
+        if 'body_lmk_rlt' in batch_flame_lmk:
+            sapiens_faces = batch_flame_lmk['body_lmk_rlt'].get('faces')  # (B, 68, 2) original image space
+            if sapiens_faces is not None:
+                M_o2c = batch_flame_lmk['head_crop']['M_o2c']  # (B, 3, 3)
+                B = sapiens_faces.shape[0]
+                # Check per-frame validity
+                sap_valid = sapiens_faces.abs().sum(dim=(1, 2)) > 0  # (B,)
+                if sap_valid.sum() > 0:
+                    # Transform ALL valid sapiens landmarks from original image space to face crop space
+                    ones = torch.ones(*sapiens_faces.shape[:-1], 1, device=sapiens_faces.device, dtype=sapiens_faces.dtype)
+                    sap_h = torch.cat([sapiens_faces, ones], dim=-1)  # (B, 68, 3)
+                    sap_crop = torch.bmm(sap_h, M_o2c.transpose(1, 2))[..., :2]  # (B, 68, 2)
+                    # Pad 68 -> 70 (extra 2 points are eye pupils, approximate from eye centers)
+                    left_eye_center = sap_crop[:, 36:42, :].mean(dim=1, keepdim=True)
+                    right_eye_center = sap_crop[:, 42:48, :].mean(dim=1, keepdim=True)
+                    sap_crop_70 = torch.cat([sap_crop, left_eye_center, right_eye_center], dim=1)  # (B, 70, 2)
+                    # Replace head_lmk_70 with Sapiens for all valid frames
+                    for i in range(B):
+                        if sap_valid[i]:
+                            batch_flame_lmk['head_lmk_70'][i] = sap_crop_70[i]
+                            batch_flame_lmk['head_lmk_valid'][i] = True
+                    n_mp_invalid = (~batch_flame_lmk['head_lmk_valid_mp']).sum().item()
+                    n_sap_valid = sap_valid.sum().item()
+                    print(f"Sapiens face landmarks: {n_sap_valid}/{B} frames valid, {n_mp_invalid} had failed MediaPipe")
+
         # Run optimization on all frames
         optim_results, id_share_params_result = self.optimize(
             all_frame_keys, batch_flame_lmk, id_share_params_result, optim_cfg=optim_cfg,

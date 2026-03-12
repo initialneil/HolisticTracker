@@ -254,9 +254,15 @@ def process_video_smplx(video_name, video_data, args, smplx_pipeline, cfg, optim
         
         # Copy the final visualization to preview path
         last_optim_cfg = optim_cfgs[-1]
-        final_vis_path = os.path.join(video_out_dir, "visual_results", 
-                                     f"vis_fit_smplx_bid-0_stp-{last_optim_cfg.steps - 1}.png")
-        if os.path.exists(final_vis_path):
+        final_vis_base = os.path.join(video_out_dir, "visual_results",
+                                     f"vis_fit_smplx_bid-0_stp-{last_optim_cfg.steps - 1}")
+        # Try both .jpg and .png extensions
+        final_vis_path = None
+        for ext in ['.jpg', '.png']:
+            if os.path.exists(final_vis_base + ext):
+                final_vis_path = final_vis_base + ext
+                break
+        if final_vis_path is not None:
             import shutil
             shutil.copy(final_vis_path, preview_path)
             print(f"  Saved preview: {preview_path}")

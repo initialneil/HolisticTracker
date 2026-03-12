@@ -573,6 +573,9 @@ class RefineSmplxPipeline(object):
         batch_mano_left = batch_base['left_mano_coeffs']
         batch_mano_right = batch_base['right_mano_coeffs']
         head_lmk_valid = batch_base['head_lmk_valid']
+        head_lmk_valid_mp = batch_base.get('head_lmk_valid_mp', head_lmk_valid)
+        # Sapiens-only frames: valid head but FLAME ref may be unreliable
+        sapiens_only_mask = head_lmk_valid & (~head_lmk_valid_mp)
         left_hand_valid = batch_base['left_hand_valid']
         right_hand_valid = batch_base['right_hand_valid']
         
@@ -913,9 +916,12 @@ class RefineSmplxPipeline(object):
             pred_head_vertices = proj_vertices[:, self.ehm.smplx.smplx2flame_ind][:, self.ehm.head_index]
             pred_head_joint = proj_joints[:, 23:25].mean(dim=1, keepdim=True)
             pred_head_vertices[..., 2] = (pred_head_vertices[..., 2] - pred_head_joint[..., 2])
-            if head_lmk_valid.sum() > 0:
-                loss_3d_head = self.metric(pred_head_vertices[head_lmk_valid],
-                                          ref_head_vertices[head_lmk_valid]) * lambda_3d_head
+            # 3D head loss: only for MP-valid frames (FLAME ref reliable)
+            # Sapiens-only frames skip 3D head loss — rely on 2D face loss instead
+            mp_head_mask = head_lmk_valid & head_lmk_valid_mp
+            if mp_head_mask.sum() > 0:
+                loss_3d_head = self.metric(pred_head_vertices[mp_head_mask],
+                                          ref_head_vertices[mp_head_mask]) * lambda_3d_head
             
             pred_hand_l_vertices = proj_vertices[:, self.ehm.smplx.smplx2mano_ind['left_hand']]
             pred_hand_l_joint = proj_joints[:, 20:21, :]
@@ -980,13 +986,18 @@ class RefineSmplxPipeline(object):
                 gt_lmk_2d['keypoints'][:, knee_feet_indices, :2].float()
             ) * lambda_2d_knee_feet
             
-            # Face landmarks loss
+            # Face landmarks loss — boost for Sapiens-only frames (2D is more reliable than 3D ref)
             loss_2d_face = 0.0
-            if head_lmk_valid.sum() > 0:
+            if mp_head_mask.sum() > 0:
                 loss_2d_face = self.metric(
-                    pred_kps3d[head_lmk_valid][:, face_kpt2d_indices, :2],
-                    gt_lmk_2d['keypoints'][head_lmk_valid][:, face_kpt2d_indices, :2].float()
+                    pred_kps3d[mp_head_mask][:, face_kpt2d_indices, :2],
+                    gt_lmk_2d['keypoints'][mp_head_mask][:, face_kpt2d_indices, :2].float()
                 ) * lambda_2d_kpt
+            if sapiens_only_mask.sum() > 0:
+                loss_2d_face += self.metric(
+                    pred_kps3d[sapiens_only_mask][:, face_kpt2d_indices, :2],
+                    gt_lmk_2d['keypoints'][sapiens_only_mask][:, face_kpt2d_indices, :2].float()
+                ) * lambda_2d_kpt * 5.0
             if (~head_lmk_valid).sum() > 0:
                 loss_2d_face += self.metric(
                     pred_kps3d[~head_lmk_valid][:, _face_anchor, :2],
@@ -1027,7 +1038,15 @@ class RefineSmplxPipeline(object):
                         torch.mean(torch.square(left_hand_shape)) * lambda_mano_shape_reg + \
                         torch.mean(torch.square(right_hand_shape)) * lambda_mano_shape_reg
             
-            loss_smplx_pose = self.pose_loss(body_pose, smplx_init_pose) * lambda_smplx_pose
+            # Pose init loss — reduce neck/head constraint for Sapiens-only frames
+            # so 2D face loss can rotate the head to match the actual face position
+            if sapiens_only_mask.sum() > 0 and mp_head_mask.sum() < body_pose.shape[0]:
+                head_neck_joints = [12, 15]  # neck, head in SMPLX body_pose
+                other_joints = [j for j in range(body_pose.shape[1]) if j not in head_neck_joints]
+                loss_smplx_pose = self.pose_loss(body_pose[:, other_joints], smplx_init_pose[:, other_joints]) * lambda_smplx_pose
+                loss_smplx_pose += self.pose_loss(body_pose[:, head_neck_joints], smplx_init_pose[:, head_neck_joints]) * lambda_smplx_pose * 0.1
+            else:
+                loss_smplx_pose = self.pose_loss(body_pose, smplx_init_pose) * lambda_smplx_pose
             loss_smplx_leg_pose = torch.mean((body_pose[:, leg_body_joints]) ** 2) * lambda_smplx_leg_pose
             loss_smplx_pose_reg = torch.mean(body_pose[:, freezed_body_joints] ** 2) * lambda_smplx_freezed_pose
             loss_smplx_pose_reg += torch.mean(body_pose**2) * lambda_smplx_pose_reg_base
@@ -1098,7 +1117,8 @@ class RefineSmplxPipeline(object):
                                       head_lmk_valid, left_hand_valid, right_hand_valid,
                                       R, T, cameras, batch_id, i_step,
                                       body_kpt2d_indices, knee_feet_indices, face_kpt2d_indices,
-                                      lhand_kpt2d_indices, rhand_kpt2d_indices)
+                                      lhand_kpt2d_indices, rhand_kpt2d_indices,
+                                      frame_keys=track_frames)
         
         # Build final camera RT for each batch index
         final_gl_T, final_gl_R_6d = make_camera_R6d_T(
@@ -1153,99 +1173,57 @@ class RefineSmplxPipeline(object):
                         head_lmk_valid, left_hand_valid, right_hand_valid,
                         R, T, cameras, batch_id, i_step,
                         body_kpt2d_indices, knee_feet_indices, face_kpt2d_indices,
-                        lhand_kpt2d_indices, rhand_kpt2d_indices):
-        """Visualize SMPL-X optimization results - save all frames in 2:1 grid layout."""
+                        lhand_kpt2d_indices, rhand_kpt2d_indices,
+                        frame_keys=None):
+        """Visualize SMPL-X optimization results - save all frames in grid layout."""
         if not self.saving_root:
             return
-        
+
         save_path = os.path.join(self.saving_root, "visual_results")
         os.makedirs(save_path, exist_ok=True)
-        
+
         n_imgs = len(batch_imgs)
         lights = PointLights(device=self.device, location=[[0.0, -1.0, -10.0]])
-        
-        # Visualize frames 
-        indices = list(range(n_imgs))[::10]
-        
+
+        # Show all frames (no stride)
+        indices = list(range(n_imgs))
+
         vis_imgs = []
         for im_idx in indices:
             _img = batch_imgs[im_idx].clone().cpu().numpy().transpose(1, 2, 0).astype(np.uint8).copy()
             _t_lmk_dwp = pred_kps3d[im_idx, :, :2]
             _landmark_dwp = gt_lmk_2d['keypoints'][im_idx, ...].detach().cpu().numpy()
-            
-            # Draw connection lines for body keypoints
-            for kp_idx in body_kpt2d_indices + knee_feet_indices:
-                pt1 = tuple(_landmark_dwp[kp_idx].astype(int))
-                pt2 = tuple(_t_lmk_dwp[kp_idx].detach().cpu().numpy().astype(int))
-                cv2.line(_img, pt1, pt2, (255, 255, 0), 1)
-            
-            # Draw face keypoints if valid
-            if head_lmk_valid[im_idx]:
-                for kp_idx in face_kpt2d_indices:
-                    pt1 = tuple(_landmark_dwp[kp_idx].astype(int))
-                    pt2 = tuple(_t_lmk_dwp[kp_idx].detach().cpu().numpy().astype(int))
-                    cv2.line(_img, pt1, pt2, (255, 200, 0), 1)
-            
-            # Draw left hand keypoints if valid
-            if left_hand_valid[im_idx]:
-                for kp_idx in lhand_kpt2d_indices:
-                    pt1 = tuple(_landmark_dwp[kp_idx].astype(int))
-                    pt2 = tuple(_t_lmk_dwp[kp_idx].detach().cpu().numpy().astype(int))
-                    cv2.line(_img, pt1, pt2, (0, 255, 255), 1)
-            
-            # Draw right hand keypoints if valid
-            if right_hand_valid[im_idx]:
-                for kp_idx in rhand_kpt2d_indices:
-                    pt1 = tuple(_landmark_dwp[kp_idx].astype(int))
-                    pt2 = tuple(_t_lmk_dwp[kp_idx].detach().cpu().numpy().astype(int))
-                    cv2.line(_img, pt1, pt2, (255, 0, 255), 1)
-            
-            # Draw landmarks
-            _img = draw_landmarks(_landmark_dwp, _img, color=(0, 255, 0), viz_index=False)
-            _img = draw_landmarks(_t_lmk_dwp, _img, color=(255, 0, 0))
-            _img = draw_landmarks(proj_face_lmk_203[im_idx, :, :2], _img, color=(0, 0, 255))
-            
-            # Render mesh
+
+            # Render mesh overlay
             t_camera = GS_Camera(**self.build_cameras_kwargs(1, self.body_focal_length),
                                 R=R[None, im_idx], T=T[None, im_idx])
             mesh_img = self.body_renderer.render_mesh(smplx_dict['vertices'][None, im_idx, ...],
                                                       t_camera, lights=lights)
             mesh_img = (mesh_img[:, :3].detach().cpu().numpy()).clip(0, 255).astype(np.uint8)[0].transpose(1, 2, 0)
-            mesh_img = cv2.addWeighted(_img, 0.3, mesh_img, 0.7, 0)
-            
-            # Draw hand details
-            img_hand = batch_imgs[im_idx].clone().cpu().numpy().transpose(1, 2, 0).astype(np.uint8).copy()
-            img_hand = draw_landmarks(ref_hand_l_joints[im_idx, :, :2], img_hand, color=(0, 0, 255))
-            img_hand = draw_landmarks(ref_hand_r_joints[im_idx, :, :2], img_hand, color=(0, 0, 255))
-            img_hand = draw_landmarks(_landmark_dwp[-42:, :], img_hand, color=(0, 255, 0))
-            img_hand = draw_landmarks(_t_lmk_dwp[-42:, :], img_hand, color=(255, 0, 0))
-            
-            if head_lmk_valid[im_idx]:
-                img_hand = draw_landmarks(ref_head_vertices[im_idx, :, :2], img_hand, color=(255, 0, 255), radius=1)
-            if left_hand_valid[im_idx]:
-                img_hand = draw_landmarks(
-                    ref_hand_l_vertices[:, self.ehm.mano.selected_vert_ids][im_idx, :, :2],
-                    img_hand, color=(255, 0, 255), radius=1
-                )
-            if right_hand_valid[im_idx]:
-                img_hand = draw_landmarks(
-                    ref_hand_r_vertices[:, self.ehm.mano.selected_vert_ids][im_idx, :, :2],
-                    img_hand, color=(255, 0, 255), radius=1
-                )
-            
-            _img = np.concatenate((_img, mesh_img, img_hand), axis=1)
-            vis_imgs.append(_img)
-        
+            blended = cv2.addWeighted(_img, 0.5, mesh_img, 0.5, 0)
+
+            # Draw landmarks on blended image
+            # Green = GT keypoints, Red = predicted/projected
+            blended = draw_landmarks(_landmark_dwp, blended, color=(0, 255, 0), viz_index=False)
+            blended = draw_landmarks(_t_lmk_dwp, blended, color=(255, 0, 0))
+
+            # Draw frame key label on top-left
+            if frame_keys is not None and im_idx < len(frame_keys):
+                label = frame_keys[im_idx]
+                font = cv2.FONT_HERSHEY_SIMPLEX
+                font_scale = 1.2
+                thickness = 2
+                (tw, th), _ = cv2.getTextSize(label, font, font_scale, thickness)
+                cv2.rectangle(blended, (0, 0), (tw + 8, th + 16), (0, 0, 0), -1)
+                cv2.putText(blended, label, (4, th + 8), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+
+            vis_imgs.append(blended)
+
         if len(vis_imgs) > 0:
-            # Calculate 1:2 aspect ratio grid layout
+            # Wide grid layout: prefer more columns than rows (like track_base)
             total_frames = len(vis_imgs)
-            grid_rows = max(1, int(np.sqrt(total_frames * 2)))
-            grid_cols = int(np.ceil(total_frames / grid_rows))
-            
-            # Adjust to maintain 1:2 ratio
-            while grid_rows < 2 * grid_cols and grid_cols > 1:
-                grid_cols -= 1
-                grid_rows = int(np.ceil(total_frames / grid_cols))
+            grid_cols = min(total_frames, 8)
+            grid_rows = int(np.ceil(total_frames / grid_cols))
             
             # Get dimensions
             img_height, img_width = vis_imgs[0].shape[:2]
@@ -1384,11 +1362,36 @@ class RefineSmplxPipeline(object):
         if batch_imgs_dict is not None:
             batch_body_imgs = [batch_imgs_dict[key] for key in all_frame_keys]
         
-        # Collate all frames
-        batch_data = [tracked_rlt[key] for key in all_frame_keys]
+        # Collate all frames (strip keys that can contain None or non-collatable data)
+        _skip_keys = {'_debug', '_projected_verts_2d'}
+        def _clean_dict(d):
+            out = {}
+            for k, v in d.items():
+                if k in _skip_keys:
+                    continue
+                if isinstance(v, dict):
+                    out[k] = _clean_dict(v)
+                else:
+                    out[k] = v
+            return out
+        batch_data = [_clean_dict(tracked_rlt[key]) for key in all_frame_keys]
         batch_data = torch.utils.data.default_collate(batch_data)
         batch_data = data_to_device(batch_data, device=self.device)
-        
+
+        # Override head_lmk_valid using Sapiens face landmarks availability
+        # Sapiens is more robust than MediaPipe — enables face fitting for head-down/occluded frames
+        # Store original MP validity for downweighting 3D head loss on Sapiens-only frames
+        batch_data['head_lmk_valid_mp'] = batch_data['head_lmk_valid'].clone()
+        if 'body_lmk_rlt' in batch_data:
+            sapiens_faces = batch_data['body_lmk_rlt'].get('faces')
+            if sapiens_faces is not None:
+                sap_valid = sapiens_faces.abs().sum(dim=(1, 2)) > 0
+                n_before = batch_data['head_lmk_valid'].sum().item()
+                batch_data['head_lmk_valid'] = batch_data['head_lmk_valid'] | sap_valid
+                n_after = batch_data['head_lmk_valid'].sum().item()
+                if n_after > n_before:
+                    print(f"Sapiens override: head_lmk_valid {n_before} -> {n_after} frames")
+
         # Run optimization on all frames
         log(f"Running SMPL-X optimization on {len(all_frame_keys)} frames...")
         optim_results, id_share_params_result = self.optimize(
