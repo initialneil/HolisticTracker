@@ -197,36 +197,50 @@ def main():
     parser.add_argument('--body_landmark_type', type=str, default='sapiens',
                         choices=['sapiens', 'dwpose'],
                         help='Body landmark detector type (default: sapiens)')
+    parser.add_argument('--body_estimator_type', type=str, default='smplerx',
+                        choices=['pixie', 'smplerx'],
+                        help='Body estimator type (default: smplerx)')
     parser.add_argument('--overwrite', action='store_true',
                         help='Overwrite existing results')
     parser.add_argument('--verbose', action='store_true',
                         help='Save debug info (sapiens kps, bboxes) into base_tracking.pkl')
 
     args = parser.parse_args()
-    
+
     # Load index JSON
     print(f"Loading index from: {args.index_json}")
     with open(args.index_json, 'r') as f:
         index_data = json.load(f)
-    
+
     print(f"Found {len(index_data)} videos in index")
-    
+
     # Initialize pipeline
     print("\nInitializing TrackBasePipeline...")
     config = DataPreparationConfig()
     config.body_landmark_type = args.body_landmark_type
+    config.body_estimator_type = args.body_estimator_type
     print(f"Body landmark type: {config.body_landmark_type}")
+    print(f"Body estimator type: {config.body_estimator_type}")
     if args.check_hand_score is not None:
         config.check_hand_score = args.check_hand_score
         print(f"Overwriting config.check_hand_score to {config.check_hand_score}")
     pipeline = TrackBasePipeline(config)
-    
+
     # Process each video
     for video_name, video_data in index_data.items():
         video_out_dir = os.path.join(args.ehmx_dir, video_name)
         base_track_path = os.path.join(video_out_dir, 'base_tracking.pkl')
         vis_path = os.path.join(video_out_dir, 'track_base.jpg')
-        
+
+        # Load pre-computed SMPLer-X results if using smplerx estimator
+        if config.body_estimator_type == 'smplerx' and video_name not in pipeline._smplerx_cache:
+            try:
+                pipeline.load_smplerx_results(args.ehmx_dir, video_name)
+            except FileNotFoundError as e:
+                print(f"\nWarning: {e}")
+                print(f"  Skipping {video_name}")
+                continue
+
         # Skip if both files exist
         if not args.overwrite and os.path.exists(base_track_path) and os.path.exists(vis_path):
             print(f"\nSkipping {video_name}: both base_tracking.pkl and track_base.jpg exist")

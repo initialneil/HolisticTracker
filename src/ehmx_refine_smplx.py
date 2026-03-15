@@ -197,7 +197,10 @@ def make_pshuman_camera(original_RT, view_id, device='cuda'):
         ], dtype=torch.float32, device=device)
         c2w_pshuman = torch.matmul(flip_z, torch.matmul(c2w_cam, mirror_x))
         """
-        # mirror_x applied first for horizontal flip
+        # Back view for horizontally-flipped pshuman_03 image:
+        # mirror_x on right: accounts for cv2.flip(img, 1) applied at load time
+        # flip_z on left: rotates camera 180° around Y to look from behind
+        # Result has det(R)=+1, safe for 6D rotation representation
         mirror_x = torch.tensor([
             [-1, 0, 0, 0],
             [0, 1, 0, 0],
@@ -205,7 +208,6 @@ def make_pshuman_camera(original_RT, view_id, device='cuda'):
             [0, 0, 0, 1]
         ], dtype=torch.float32, device=device)
 
-        # Z-axis flip for back view (if didn't flip while loading)
         flip_z = torch.tensor([
             [1, 0, 0, 0],
             [0, 1, 0, 0],
@@ -288,12 +290,15 @@ def group_frames_by_camera(frame_keys):
     return camera_groups
 
 
-def make_camera_R6d_T(unique_gl_T, unique_gl_R_6d, batch_to_camera_idx, unique_cameras, camera_to_idx, camera_is_pshuman, camera_source_key, batch_size, device='cuda'):
+def make_camera_R_T(unique_gl_T, unique_gl_R_6d, batch_to_camera_idx, unique_cameras, camera_to_idx, camera_is_pshuman, camera_source_key, batch_size, device='cuda'):
     """
     Expand camera parameters for batch based on camera types.
     For regular cameras, uses optimized parameters directly.
     For PSHuman cameras, derives from source camera using transformation.
-    
+
+    Returns R matrices directly (not 6D) to avoid lossy roundtrip for
+    improper rotations (det=-1) that occur with PSHuman back-view cameras.
+
     Args:
         unique_gl_T: Optimized translation parameters for unique cameras
         unique_gl_R_6d: Optimized 6D rotation parameters for unique cameras
@@ -304,47 +309,49 @@ def make_camera_R6d_T(unique_gl_T, unique_gl_R_6d, batch_to_camera_idx, unique_c
         camera_source_key: Dict mapping camera_key to source camera_key (for PSHuman)
         batch_size: Number of frames in batch
         device: Device for tensor operations
-    
+
     Returns:
-        Tuple of (gl_T, gl_R_6d) tensors expanded to batch size
+        Tuple of (gl_T, gl_R) tensors expanded to batch size,
+        where gl_R is (batch, 3, 3) rotation matrices
     """
     gl_T_list = []
-    gl_R_6d_list = []
-    
+    gl_R_list = []
+
     for batch_idx in range(batch_size):
         camera_idx = batch_to_camera_idx[batch_idx].item()
         camera_key = unique_cameras[camera_idx]
-        
+
         if camera_is_pshuman[camera_key]:
             # PSHuman camera: derive from source camera
             source_key = camera_source_key[camera_key]
             if source_key in camera_to_idx:
                 source_camera_idx = camera_to_idx[source_key]
-                
+
                 # Build source camera RT from optimized params
                 source_RT = torch.eye(4, device=device, dtype=torch.float32)
                 source_RT[:3, 3] = unique_gl_T[source_camera_idx]
                 source_RT[:3, :3] = rotation_6d_to_matrix(unique_gl_R_6d[source_camera_idx])
-                
+
                 # Extract view_id from camera_key (format: shot_id/frame_id/view_id)
                 view_id = camera_key.split('/')[-1]
-                
+
                 # Calculate PSHuman camera
+                # NOTE: pshuman back-view cameras have det(R)=-1 (improper rotation).
+                # We return R directly to avoid the 6D roundtrip which forces det=+1.
                 pshuman_RT = make_pshuman_camera(source_RT[:3, :4], view_id, device)
-                
-                # Extract T and R_6d
+
                 gl_T_list.append(pshuman_RT[:3, 3])
-                gl_R_6d_list.append(matrix_to_rotation_6d(pshuman_RT[:3, :3]))
+                gl_R_list.append(pshuman_RT[:3, :3])
             else:
                 # Fallback: use camera params directly
                 gl_T_list.append(unique_gl_T[camera_idx])
-                gl_R_6d_list.append(unique_gl_R_6d[camera_idx])
+                gl_R_list.append(rotation_6d_to_matrix(unique_gl_R_6d[camera_idx]))
         else:
             # Regular camera: use optimized parameters directly
             gl_T_list.append(unique_gl_T[camera_idx])
-            gl_R_6d_list.append(unique_gl_R_6d[camera_idx])
-    
-    return torch.stack(gl_T_list, dim=0), torch.stack(gl_R_6d_list, dim=0)
+            gl_R_list.append(rotation_6d_to_matrix(unique_gl_R_6d[camera_idx]))
+
+    return torch.stack(gl_T_list, dim=0), torch.stack(gl_R_list, dim=0)
 
 
 class RefineSmplxPipeline(object):
@@ -465,13 +472,14 @@ class RefineSmplxPipeline(object):
             ret_image=False
         )
         
+        head_transform = body_crop_meta['M_o2c-hd'].float() @ head_crop_meta['M_c2o'].float()
         ref_head_vertices = self.transform_head_pts3d_to_image_coord(
             render_rlt[0][:, np.unique(self.ehm.flame.head_index)],
-            body_crop_meta['M_o2c-hd'] @ head_crop_meta['M_c2o']
+            head_transform
         )
         ref_head_joints = self.transform_head_pts3d_to_image_coord(
             render_rlt[1]['joints'],
-            body_crop_meta['M_o2c-hd'] @ head_crop_meta['M_c2o']
+            head_transform
         )
         ref_head_vertices[..., 2] = (ref_head_vertices[..., 2] - ref_head_joints[:, 3:5, 2].mean(dim=1, keepdim=True))
         
@@ -484,14 +492,15 @@ class RefineSmplxPipeline(object):
             transform_matrix=left_hand_coeff_lst['camera_RT_params'],
             ret_image=False
         )
+        lh_transform = body_crop_meta['M_o2c-hd'].float() @ left_hand_crop_meta['M_c2o'].float()
         ref_hand_l_vertices = self.transform_hand_pts3d_to_image_coord(
             render_rlt[0],
-            body_crop_meta['M_o2c-hd'] @ left_hand_crop_meta['M_c2o'],
+            lh_transform,
             img_size, True
         )
         ref_hand_l_joints = self.transform_hand_pts3d_to_image_coord(
             render_rlt[1]['joints'],
-            body_crop_meta['M_o2c-hd'] @ left_hand_crop_meta['M_c2o'],
+            lh_transform,
             img_size, True
         )
         ref_hand_l_vertices[..., 2] = ref_hand_l_vertices[..., 2] - ref_hand_l_joints[:, 0:1, 2]
@@ -505,14 +514,15 @@ class RefineSmplxPipeline(object):
             transform_matrix=right_hand_coeff_lst['camera_RT_params'],
             ret_image=False
         )
+        rh_transform = body_crop_meta['M_o2c-hd'].float() @ right_hand_crop_meta['M_c2o'].float()
         ref_hand_r_vertices = self.transform_hand_pts3d_to_image_coord(
             render_rlt[0],
-            body_crop_meta['M_o2c-hd'] @ right_hand_crop_meta['M_c2o'],
+            rh_transform,
             img_size
         )
         ref_hand_r_joints = self.transform_hand_pts3d_to_image_coord(
             render_rlt[1]['joints'],
-            body_crop_meta['M_o2c-hd'] @ right_hand_crop_meta['M_c2o'],
+            rh_transform,
             img_size
         )
         ref_hand_r_vertices[..., 2] = ref_hand_r_vertices[..., 2] - ref_hand_r_joints[:, 0:1, 2]
@@ -776,6 +786,9 @@ class RefineSmplxPipeline(object):
             is_pshuman_list.append(is_pshuman)
         is_pshuman_tensor = torch.tensor(is_pshuman_list, device=self.device).bool()
 
+        # Group frames by shot for temporal regularization (no cross-shot smoothing)
+        shot_groups = group_frames_by_shots(track_frames)
+
         # Learning rate decay for multi-batch
         _lr_decay = 1.0
         if batch_id > 0:
@@ -843,7 +856,7 @@ class RefineSmplxPipeline(object):
             {'params': [right_hand_shape], 'lr': 1e-4 * _lr_decay},
             {'params': [unique_gl_T], 'lr': 5e-3 * _lr_camera},
             {'params': [unique_gl_R_6d], 'lr': 5e-4 * _lr_camera},
-            {'params': [joints_offset], 'lr': 1e-5 * _lr_decay},
+            {'params': [joints_offset], 'lr': 1e-4 * _lr_decay},
             {'params': [g_flame_shape], 'lr': 2e-5 * _lr_decay},
             {'params': [head_scale], 'lr': 1e-4 * _lr_decay},
             {'params': [hand_scale], 'lr': 1e-4 * _lr_decay},
@@ -889,7 +902,7 @@ class RefineSmplxPipeline(object):
             batch_smplx['right_hand_pose'] = right_hand_pose.expand(batch_size, -1, -1) if share_pose else right_hand_pose
             
             # Expand camera parameters (regular directly, PSHuman derived)
-            gl_T, gl_R_6d = make_camera_R6d_T(
+            gl_T, gl_R = make_camera_R_T(
                 unique_gl_T, unique_gl_R_6d, batch_to_camera_idx,
                 unique_cameras, camera_to_idx, camera_is_pshuman, camera_source_key,
                 batch_size, self.device
@@ -904,7 +917,7 @@ class RefineSmplxPipeline(object):
             
             smplx_dict = self.ehm(batch_smplx, batch_flame, pose_type='aa')
             T = gl_T
-            R = rotation_6d_to_matrix(gl_R_6d)
+            R = gl_R
             T = T.squeeze(-1)
             proj_vertices = cameras.transform_points_screen(smplx_dict['vertices'], R=R, T=T)
             proj_joints = cameras.transform_points_screen(smplx_dict['joints'], R=R, T=T)
@@ -950,12 +963,13 @@ class RefineSmplxPipeline(object):
             pred_kps3d = self.smplx_joints_to_body_lmk(proj_joints)[0]
             
             # Define keypoint groups (format-aware)
+            # Elbows + wrists stay in body group (not hand) so they always get loss
             if self.body_landmark_type == 'sapiens':
                 # COCO Wholebody 133-keypoint ordering
                 knee_feet_indices = [13, 14, 15, 16, 17, 18, 19, 20, 21, 22]
                 face_kpt2d_indices = list(range(23, 91)) + [0, 1, 2, 3, 4]
-                lhand_kpt2d_indices = list(range(91, 112)) + [7, 9]
-                rhand_kpt2d_indices = list(range(112, 133)) + [8, 10]
+                lhand_kpt2d_indices = list(range(91, 112))  # 21 finger keypoints only
+                rhand_kpt2d_indices = list(range(112, 133))  # 21 finger keypoints only
                 # Fallback anchor indices for invalid regions
                 _face_anchor = 0   # nose
                 _lhand_anchor = 9  # left_wrist
@@ -964,14 +978,14 @@ class RefineSmplxPipeline(object):
                 # DWPose / openpose 134-keypoint ordering
                 knee_feet_indices = [9, 10, 12, 13, 18, 19, 20, 21, 22, 23]
                 face_kpt2d_indices = list(range(24, 92)) + [14, 15, 16, 17]
-                lhand_kpt2d_indices = list(range(92, 113)) + [6, 7]
-                rhand_kpt2d_indices = list(range(113, 134)) + [3, 4]
+                lhand_kpt2d_indices = list(range(92, 113))  # 21 finger keypoints only
+                rhand_kpt2d_indices = list(range(113, 134))  # 21 finger keypoints only
                 _face_anchor = 15  # left_eye
                 _lhand_anchor = 7  # left_wrist
                 _rhand_anchor = 4  # right_wrist
             all_kpt2d_indices = list(range(pred_kps3d.shape[1]))
-            body_kpt2d_indices = [i for i in all_kpt2d_indices 
-                                 if i not in knee_feet_indices and i not in face_kpt2d_indices 
+            body_kpt2d_indices = [i for i in all_kpt2d_indices
+                                 if i not in knee_feet_indices and i not in face_kpt2d_indices
                                  and i not in lhand_kpt2d_indices and i not in rhand_kpt2d_indices]
             
             # Body keypoints loss
@@ -998,10 +1012,12 @@ class RefineSmplxPipeline(object):
                     pred_kps3d[sapiens_only_mask][:, face_kpt2d_indices, :2],
                     gt_lmk_2d['keypoints'][sapiens_only_mask][:, face_kpt2d_indices, :2].float()
                 ) * lambda_2d_kpt * 5.0
-            if (~head_lmk_valid).sum() > 0:
+            # Face anchor fallback: skip pshuman frames (their init face pose is unreliable)
+            face_anchor_mask = (~head_lmk_valid) & (~is_pshuman_tensor)
+            if face_anchor_mask.sum() > 0:
                 loss_2d_face += self.metric(
-                    pred_kps3d[~head_lmk_valid][:, _face_anchor, :2],
-                    ret_body_ref[~head_lmk_valid][:, _face_anchor, :2]
+                    pred_kps3d[face_anchor_mask][:, _face_anchor, :2],
+                    ret_body_ref[face_anchor_mask][:, _face_anchor, :2]
                 ) * lambda_smplx_init
             
             # Left hand landmarks loss
@@ -1038,13 +1054,23 @@ class RefineSmplxPipeline(object):
                         torch.mean(torch.square(left_hand_shape)) * lambda_mano_shape_reg + \
                         torch.mean(torch.square(right_hand_shape)) * lambda_mano_shape_reg
             
-            # Pose init loss — reduce neck/head constraint for Sapiens-only frames
-            # so 2D face loss can rotate the head to match the actual face position
-            if sapiens_only_mask.sum() > 0 and mp_head_mask.sum() < body_pose.shape[0]:
+            # Pose init loss — per-frame head/neck weight based on landmark quality
+            # MP-valid: full weight (reliable FLAME ref + MediaPipe landmarks)
+            # Sapiens-only: 0.1x (2D face loss can rotate head to match actual face)
+            # PSHuman: 0x (init pose unreliable for side/back views)
+            has_special = (sapiens_only_mask.sum() > 0 or is_pshuman_tensor.sum() > 0)
+            if has_special:
                 head_neck_joints = [12, 15]  # neck, head in SMPLX body_pose
                 other_joints = [j for j in range(body_pose.shape[1]) if j not in head_neck_joints]
+                # All frames: full weight for non-head joints
                 loss_smplx_pose = self.pose_loss(body_pose[:, other_joints], smplx_init_pose[:, other_joints]) * lambda_smplx_pose
-                loss_smplx_pose += self.pose_loss(body_pose[:, head_neck_joints], smplx_init_pose[:, head_neck_joints]) * lambda_smplx_pose * 0.1
+                # MP-valid frames: full weight for head/neck
+                if mp_head_mask.sum() > 0:
+                    loss_smplx_pose += self.pose_loss(body_pose[mp_head_mask][:, head_neck_joints], smplx_init_pose[mp_head_mask][:, head_neck_joints]) * lambda_smplx_pose
+                # Sapiens-only frames: 0.1x for head/neck
+                if sapiens_only_mask.sum() > 0:
+                    loss_smplx_pose += self.pose_loss(body_pose[sapiens_only_mask][:, head_neck_joints], smplx_init_pose[sapiens_only_mask][:, head_neck_joints]) * lambda_smplx_pose * 0.1
+                # PSHuman frames: zero head/neck pose init (no reliable reference)
             else:
                 loss_smplx_pose = self.pose_loss(body_pose, smplx_init_pose) * lambda_smplx_pose
             loss_smplx_leg_pose = torch.mean((body_pose[:, leg_body_joints]) ** 2) * lambda_smplx_leg_pose
@@ -1060,45 +1086,33 @@ class RefineSmplxPipeline(object):
             loss_prior = loss_prior + loss_smplx_pose + loss_smplx_pose_reg + loss_scale_reg + \
                         loss_joint_offset_reg + loss_smplx_leg_pose + loss_smplx_hand_pose_reg
             
-            ### Motion regularization loss
+            ### Motion regularization loss (per-shot, no cross-shot smoothing)
             mtn_reg_loss = 0
-            if body_pose.shape[0] > 1:
-                # Helper for anchored motion loss
-                def get_anchored_diff(tensor, is_anchor):
-                    curr = tensor[1:]
-                    prev = tensor[:-1]
-                    return curr, prev
-                    # curr_anchor = is_anchor[1:]
-                    # prev_anchor = is_anchor[:-1]
-                    
-                    # view_shape = [-1] + [1] * (tensor.ndim - 1)
-                    # curr_mask = curr_anchor.view(*view_shape)
-                    # prev_mask = prev_anchor.view(*view_shape)
-                    
-                    # curr_term = torch.where(curr_mask, curr.detach(), curr)
-                    # prev_term = torch.where(prev_mask, prev.detach(), prev)
-                    # return curr_term, prev_term
+            for shot_idx_list in shot_groups:
+                if len(shot_idx_list) <= 1:
+                    continue
+                sidx = sorted(shot_idx_list)
 
-                curr_bp, prev_bp = get_anchored_diff(body_pose, is_pshuman_tensor)
-                mtn_reg_loss += self.metric(curr_bp, prev_bp) * lambda_mtn_body_pose / (interval * 1)
-                
-                curr_lhp, prev_lhp = get_anchored_diff(left_hand_pose, is_pshuman_tensor)
-                mtn_reg_loss += self.metric(curr_lhp, prev_lhp) * lambda_mtn_hand_pose / (interval * 1)
-                
-                curr_rhp, prev_rhp = get_anchored_diff(right_hand_pose, is_pshuman_tensor)
-                mtn_reg_loss += self.metric(curr_rhp, prev_rhp) * lambda_mtn_hand_pose / (interval * 1)
-                
-                curr_rot, prev_rot = get_anchored_diff(gl_R_6d, is_pshuman_tensor)
-                mtn_reg_loss += self.metric(curr_rot, prev_rot) * lambda_mtn_rot6d / (interval * 1)
-                
-                curr_T, prev_T = get_anchored_diff(T, is_pshuman_tensor)
-                mtn_reg_loss += self.metric(curr_T, prev_T) * lambda_mtn_trans / (interval * 1)
-                
-                curr_Tz, prev_Tz = get_anchored_diff(T[..., 2:3], is_pshuman_tensor)
-                mtn_reg_loss += self.metric(curr_Tz, prev_Tz) * lambda_mtn_trans_z / (interval * 1)
-                
-                curr_v, prev_v = get_anchored_diff(proj_vertices, is_pshuman_tensor)
-                mtn_reg_loss += self.metric(curr_v, prev_v) * lambda_mtn_vertices / (interval * 1)
+                s_bp = body_pose[sidx]
+                mtn_reg_loss += self.metric(s_bp[1:], s_bp[:-1]) * lambda_mtn_body_pose / (interval * 1)
+
+                s_lhp = left_hand_pose[sidx]
+                mtn_reg_loss += self.metric(s_lhp[1:], s_lhp[:-1]) * lambda_mtn_hand_pose / (interval * 1)
+
+                s_rhp = right_hand_pose[sidx]
+                mtn_reg_loss += self.metric(s_rhp[1:], s_rhp[:-1]) * lambda_mtn_hand_pose / (interval * 1)
+
+                s_rot = gl_R[sidx]
+                mtn_reg_loss += self.metric(s_rot[1:], s_rot[:-1]) * lambda_mtn_rot6d / (interval * 1)
+
+                s_T = T[sidx]
+                mtn_reg_loss += self.metric(s_T[1:], s_T[:-1]) * lambda_mtn_trans / (interval * 1)
+
+                s_Tz = T[sidx][..., 2:3]
+                mtn_reg_loss += self.metric(s_Tz[1:], s_Tz[:-1]) * lambda_mtn_trans_z / (interval * 1)
+
+                s_v = proj_vertices[sidx]
+                mtn_reg_loss += self.metric(s_v[1:], s_v[:-1]) * lambda_mtn_vertices / (interval * 1)
             
             total_loss = loss_3d + loss_2d + loss_prior + mtn_reg_loss
             loss_line = f'total: {total_loss:.2f} | 3d: {loss_3d:.2f} | 2d: {loss_2d:.2f} | prior: {loss_prior:.2f} | mtn: {mtn_reg_loss:.2f}'
@@ -1121,17 +1135,17 @@ class RefineSmplxPipeline(object):
                                       frame_keys=track_frames)
         
         # Build final camera RT for each batch index
-        final_gl_T, final_gl_R_6d = make_camera_R6d_T(
+        final_gl_T, final_gl_R = make_camera_R_T(
             unique_gl_T.detach(), unique_gl_R_6d.detach(), batch_to_camera_idx,
             unique_cameras, camera_to_idx, camera_is_pshuman, camera_source_key,
             batch_size, self.device
         )
-        
+
         final_camera_RT_list = []
         for batch_idx in range(batch_size):
             final_RT = torch.eye(4, device=self.device, dtype=torch.float32)
             final_RT[:3, 3] = final_gl_T[batch_idx]
-            final_RT[:3, :3] = rotation_6d_to_matrix(final_gl_R_6d[batch_idx])
+            final_RT[:3, :3] = final_gl_R[batch_idx]
             final_camera_RT_list.append(final_RT[:3, :4])
         
         final_camera_RT = torch.stack(final_camera_RT_list, dim=0)
@@ -1375,17 +1389,41 @@ class RefineSmplxPipeline(object):
                     out[k] = v
             return out
         batch_data = [_clean_dict(tracked_rlt[key]) for key in all_frame_keys]
+        # Ensure consistent keys across all frames for collation
+        # (SMPLer-X adds keys like cam_trans/bbox/abs_* that pshuman frames lack)
+        if len(batch_data) > 1:
+            common_keys = set(batch_data[0].keys())
+            for item in batch_data[1:]:
+                common_keys &= set(item.keys())
+            for item in batch_data:
+                for k in list(item.keys()):
+                    if k not in common_keys:
+                        del item[k]
+                    elif isinstance(item[k], dict):
+                        nested_common = set(batch_data[0].get(k, {}).keys())
+                        for other in batch_data[1:]:
+                            nested_common &= set(other.get(k, {}).keys())
+                        for nk in list(item[k].keys()):
+                            if nk not in nested_common:
+                                del item[k][nk]
         batch_data = torch.utils.data.default_collate(batch_data)
         batch_data = data_to_device(batch_data, device=self.device)
 
         # Override head_lmk_valid using Sapiens face landmarks availability
         # Sapiens is more robust than MediaPipe — enables face fitting for head-down/occluded frames
         # Store original MP validity for downweighting 3D head loss on Sapiens-only frames
+        # IMPORTANT: Do NOT override pshuman frames — Sapiens may detect faces on synthetic
+        # side/back views but those landmarks are unreliable
+        is_pshuman = torch.tensor([
+            'pshuman' in (split_frame_key(fk)[2] or '')
+            for fk in all_frame_keys
+        ], device=self.device).bool()
         batch_data['head_lmk_valid_mp'] = batch_data['head_lmk_valid'].clone()
         if 'body_lmk_rlt' in batch_data:
             sapiens_faces = batch_data['body_lmk_rlt'].get('faces')
             if sapiens_faces is not None:
                 sap_valid = sapiens_faces.abs().sum(dim=(1, 2)) > 0
+                sap_valid = sap_valid & (~is_pshuman)  # exclude pshuman frames
                 n_before = batch_data['head_lmk_valid'].sum().item()
                 batch_data['head_lmk_valid'] = batch_data['head_lmk_valid'] | sap_valid
                 n_after = batch_data['head_lmk_valid'].sum().item()

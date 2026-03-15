@@ -129,21 +129,31 @@ def split_frame_key(frame_key):
 
 def load_frame_image(images_dir, video_name, frame_key, pshuman_dir=None):
     shot_id, frame_id, view_id = split_frame_key(frame_key)
-    
+
     if view_id is None:
         img_path = os.path.join(images_dir, video_name, shot_id, f"{frame_id}.jpg")
     elif 'pshuman' in view_id:
         img_path = os.path.join(pshuman_dir, video_name, shot_id, frame_id, f"color_{view_id.split('_')[-1]}.jpg")
     else:
         img_path = os.path.join(images_dir, video_name, shot_id, frame_id, f"{view_id:02}.jpg")
-        
+
     if not os.path.exists(img_path):
         return None
-        
+
     img = load_image(img_path)
     if view_id is not None and 'pshuman' in view_id:
         if '03' in view_id:
-            img = cv2.flip(img, 1)  # Horizontal flip for left view
+            img = cv2.flip(img, 1)  # Horizontal flip for back view
+        # Resize pshuman to match source front view resolution so that
+        # body_crop M_o2c is identical (camera RT is derived from front camera)
+        front_path = os.path.join(images_dir, video_name, shot_id, f"{frame_id}.jpg")
+        if os.path.exists(front_path):
+            from PIL import Image as _PILImage
+            with _PILImage.open(front_path) as _pil:
+                fw, fh = _pil.size
+            ph, pw = img.shape[:2]
+            if (ph, pw) != (fh, fw):
+                img = cv2.resize(img, (fw, fh), interpolation=cv2.INTER_LANCZOS4)
     return img
 
 
@@ -190,8 +200,14 @@ class TrackBasePipeline:
             self.body_lmk_detector = instantiate_from_config(load_config(self.cfg.dwpose_cfg_path))
             self.body_lmk_detector.warmup()
         
-        self.pixie_encoder = instantiate_from_config(load_config(self.cfg.pixie_cfg_path))
-        self.pixie_encoder.to(self.device)
+        self.body_estimator_type = getattr(config, 'body_estimator_type', 'pixie')
+        if self.body_estimator_type == 'pixie':
+            self.pixie_encoder = instantiate_from_config(load_config(self.cfg.pixie_cfg_path))
+            self.pixie_encoder.to(self.device)
+        else:
+            self.pixie_encoder = None
+            print(f"  Using pre-computed SMPLer-X body estimates (skipping PIXIE)")
+        self._smplerx_cache = {}  # video_name -> {frame_key -> result}
         
         self.matte = instantiate_from_config(load_config(self.cfg.matting_cfg_path))
         self.matte.to(self.device)
@@ -227,7 +243,88 @@ class TrackBasePipeline:
         self.landmark_runner.warmup()
         
         print("Models initialized successfully")
-    
+
+    def load_smplerx_results(self, ehmx_dir, video_name):
+        """Load pre-computed SMPLer-X results for a video."""
+        import pickle
+        pkl_path = os.path.join(ehmx_dir, video_name, 'smplerx_init.pkl')
+        if not os.path.exists(pkl_path):
+            raise FileNotFoundError(f"SMPLer-X results not found: {pkl_path}\n"
+                                    f"Run run_smplerx_inference.py first.")
+        with open(pkl_path, 'rb') as f:
+            results = pickle.load(f)
+        self._smplerx_cache[video_name] = results
+        print(f"  Loaded SMPLer-X results: {len(results)} frames from {pkl_path}")
+        return results
+
+    def _get_smplerx_coeffs(self, frame_key):
+        """Get SMPLer-X coefficients for a frame.
+
+        Like FLAME/MANO: we use pose params for init and 2D projected joints
+        as regularization targets. Camera is NOT taken from SMPLer-X — the SMPLX
+        optimizer fits camera from Sapiens 2D body landmarks.
+        """
+        for video_name, results in self._smplerx_cache.items():
+            if frame_key in results:
+                result = results[frame_key]
+                if result is None:
+                    return None
+                coeff = {k: v.copy() if isinstance(v, np.ndarray) else v
+                         for k, v in result.items()}
+                # Use neutral camera init — optimizer will fit from 2D landmarks
+                body_cam = np.array([[1.0, 0.0, 0.0]], dtype=np.float32)
+                camera_RT = self.cvt_cam_to_persp_cam_fov_body(
+                    torch.from_numpy(body_cam).float()).numpy()
+                coeff['body_cam'] = body_cam
+                coeff['camera_RT_params'] = camera_RT
+                # Clamp extreme head rotations (pitch ±20°, yaw ±70°, roll ±10°)
+                self._clamp_head_pose(coeff)
+                return coeff
+        return None
+
+    @staticmethod
+    def _clamp_head_pose(coeff):
+        """Clamp head pose Euler components. Zeroes components exceeding thresholds."""
+        from scipy.spatial.transform import Rotation
+        bp = coeff['body_pose']  # (1, 21, 3) axis-angle
+        head_aa = bp[0, 15]  # (3,) axis-angle for head joint
+        if np.linalg.norm(head_aa) < 1e-6:
+            return
+        rot = Rotation.from_rotvec(head_aa)
+        euler = rot.as_euler('XYZ')  # radians
+        max_angles = [np.radians(20), np.radians(70), np.radians(10)]  # pitch, yaw, roll
+        clamped = False
+        for i, max_a in enumerate(max_angles):
+            if abs(euler[i]) > max_a:
+                euler[i] = 0.0
+                clamped = True
+        if clamped:
+            new_rot = Rotation.from_euler('XYZ', euler)
+            bp[0, 15] = new_rot.as_rotvec()
+            coeff['head_pose'] = bp[:, 15:16, :]
+
+    def _zero_smplx_coeffs(self):
+        """Return zero-initialized SMPLX coefficients as fallback (pshuman frames)."""
+        body_cam = np.array([[1.0, 0.0, 0.0]], dtype=np.float32)
+        camera_RT = self.cvt_cam_to_persp_cam_fov_body(torch.from_numpy(body_cam).float()).numpy()
+        return {
+            'global_pose': np.zeros((1, 1, 3), dtype=np.float32),
+            'body_pose': np.zeros((1, 21, 3), dtype=np.float32),
+            'neck_pose': np.zeros((1, 1, 3), dtype=np.float32),
+            'head_pose': np.zeros((1, 1, 3), dtype=np.float32),
+            'jaw_pose': np.zeros((1, 1, 3), dtype=np.float32),
+            'left_hand_pose': np.zeros((1, 15, 3), dtype=np.float32),
+            'right_hand_pose': np.zeros((1, 15, 3), dtype=np.float32),
+            'left_wrist_pose': np.zeros((1, 1, 3), dtype=np.float32),
+            'right_wrist_pose': np.zeros((1, 1, 3), dtype=np.float32),
+            'shape': np.zeros((1, 200), dtype=np.float32),
+            'exp': np.zeros((1, 50), dtype=np.float32),
+            'body_cam': body_cam,
+            'camera_RT_params': camera_RT,
+            'tex': np.zeros((1, 50), dtype=np.float32),
+            'light': np.zeros((1, 27), dtype=np.float32),
+        }
+
     def cvt_cam_to_persp_cam_fov(self, wcam):
         """Convert camera parameters to perspective camera with FOV."""
         R, T = cam2persp_cam_fov(wcam, tanfov=self.cfg.tanfov)
@@ -345,10 +442,13 @@ class TrackBasePipeline:
         img_crop = torch.nn.functional.interpolate(img_hd, (224, 224))
         
         # Extract body parameters
-        coeff_param = self.pixie_encoder(img_crop, img_hd)['body']
-        coeff_param = orginaze_body_pose(coeff_param)
-        coeff_param['camera_RT_params'] = self.cvt_cam_to_persp_cam_fov_body(coeff_param['body_cam'])
-        coeff_param = {k: v.cpu().numpy() for k, v in coeff_param.items()}
+        if self.pixie_encoder is not None:
+            coeff_param = self.pixie_encoder(img_crop, img_hd)['body']
+            coeff_param = orginaze_body_pose(coeff_param)
+            coeff_param['camera_RT_params'] = self.cvt_cam_to_persp_cam_fov_body(coeff_param['body_cam'])
+            coeff_param = {k: v.cpu().numpy() for k, v in coeff_param.items()}
+        else:
+            coeff_param = self._zero_smplx_coeffs()
         base_results['smplx_coeffs'] = coeff_param
         mean_shape_results['smplx_shape'] = coeff_param['shape']
         
@@ -492,6 +592,10 @@ class TrackBasePipeline:
             mean_shape_results = {}
 
             # Detect body pose and keypoints
+            # Detect body pose and keypoints
+            # NOTE: pshuman_03 L/R is "wrong" visually but matches make_pshuman_camera(mirror_x)
+            # so we do NOT swap L/R — they're consistent in the optimization
+            frame_key = fd.get('frame_key')
             det_info, det_raw_info = self.body_lmk_detector(img_rgb)
 
             # Use full image as bbox (no_body_crop mode)
@@ -540,19 +644,35 @@ class TrackBasePipeline:
                 base_results['left_hand_valid'] = False
                 base_results['right_hand_valid'] = False
 
-            # Body image and PIXIE body params
+            # Body image and body params (PIXIE or SMPLer-X)
             img_crop_body = crop_info['img_crop']
             img_hd = crop_info_hd['img_crop']
             ret_images['body_image'] = img_hd
 
-            img_crop_t = image2tensor(img_crop_body).to(self.device).unsqueeze(0)
-            img_hd_t = image2tensor(img_hd).to(self.device).unsqueeze(0)
-            img_crop_t = torch.nn.functional.interpolate(img_hd_t, (224, 224))
-
-            coeff_param = self.pixie_encoder(img_crop_t, img_hd_t)['body']
-            coeff_param = orginaze_body_pose(coeff_param)
-            coeff_param['camera_RT_params'] = self.cvt_cam_to_persp_cam_fov_body(coeff_param['body_cam'])
-            coeff_param = {k: v.cpu().numpy() for k, v in coeff_param.items()}
+            frame_key = fd.get('frame_key')
+            if self.body_estimator_type == 'smplerx' and frame_key:
+                coeff_param = self._get_smplerx_coeffs(frame_key)
+                if coeff_param is None:
+                    # Fallback: use PIXIE if available, else zero init
+                    if self.pixie_encoder is not None:
+                        img_crop_t = image2tensor(img_crop_body).to(self.device).unsqueeze(0)
+                        img_hd_t = image2tensor(img_hd).to(self.device).unsqueeze(0)
+                        img_crop_t = torch.nn.functional.interpolate(img_hd_t, (224, 224))
+                        coeff_param = self.pixie_encoder(img_crop_t, img_hd_t)['body']
+                        coeff_param = orginaze_body_pose(coeff_param)
+                        coeff_param['camera_RT_params'] = self.cvt_cam_to_persp_cam_fov_body(coeff_param['body_cam'])
+                        coeff_param = {k: v.cpu().numpy() for k, v in coeff_param.items()}
+                    else:
+                        # Zero init fallback (shouldn't happen for standard frames)
+                        coeff_param = self._zero_smplx_coeffs()
+            else:
+                img_crop_t = image2tensor(img_crop_body).to(self.device).unsqueeze(0)
+                img_hd_t = image2tensor(img_hd).to(self.device).unsqueeze(0)
+                img_crop_t = torch.nn.functional.interpolate(img_hd_t, (224, 224))
+                coeff_param = self.pixie_encoder(img_crop_t, img_hd_t)['body']
+                coeff_param = orginaze_body_pose(coeff_param)
+                coeff_param['camera_RT_params'] = self.cvt_cam_to_persp_cam_fov_body(coeff_param['body_cam'])
+                coeff_param = {k: v.cpu().numpy() for k, v in coeff_param.items()}
             base_results['smplx_coeffs'] = coeff_param
             mean_shape_results['smplx_shape'] = coeff_param['shape']
 

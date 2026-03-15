@@ -17,6 +17,7 @@ from .utils.graphics import GS_Camera
 from .utils.helper import build_minibatch
 from .losses import Landmark2DLoss
 from .utils.draw import draw_landmarks
+from .ehmx_track_base import split_frame_key
 
 np.random.seed(0)
 
@@ -774,6 +775,25 @@ class RefineFlamePipeline(object):
         for key in all_frame_keys:
             batch_flame_lmk.append(_clean_dict(tracked_rlt[key]))
 
+        # Ensure consistent keys across all frames for collation
+        # (SMPLer-X adds keys like cam_trans/bbox/abs_* that pshuman frames lack)
+        if len(batch_flame_lmk) > 1:
+            common_keys = set(batch_flame_lmk[0].keys())
+            for item in batch_flame_lmk[1:]:
+                common_keys &= set(item.keys())
+            for i, item in enumerate(batch_flame_lmk):
+                # Also intersect nested dict keys (e.g. smplx_coeffs)
+                for k in list(item.keys()):
+                    if k not in common_keys:
+                        del item[k]
+                    elif isinstance(item[k], dict):
+                        nested_common = set(batch_flame_lmk[0].get(k, {}).keys())
+                        for other in batch_flame_lmk[1:]:
+                            nested_common &= set(other.get(k, {}).keys())
+                        for nk in list(item[k].keys()):
+                            if nk not in nested_common:
+                                del item[k][nk]
+
         # special fix for dwpose_raw.bbox
         for idx, item in enumerate(batch_flame_lmk):
             if 'dwpose_raw' in item and 'bbox' in item['dwpose_raw']:
@@ -786,14 +806,21 @@ class RefineFlamePipeline(object):
 
         # Use Sapiens face landmarks for ALL frames in lmk_fan (more robust than MediaPipe 70-pt)
         # Also enables FLAME optimization for frames where MediaPipe failed entirely
+        # IMPORTANT: Do NOT override pshuman frames — Sapiens may detect faces on synthetic
+        # side/back views but those landmarks are unreliable
+        is_pshuman = torch.tensor([
+            'pshuman' in (split_frame_key(fk)[2] or '')
+            for fk in all_frame_keys
+        ], device=self.device).bool()
         batch_flame_lmk['head_lmk_valid_mp'] = batch_flame_lmk['head_lmk_valid'].clone()
         if 'body_lmk_rlt' in batch_flame_lmk:
             sapiens_faces = batch_flame_lmk['body_lmk_rlt'].get('faces')  # (B, 68, 2) original image space
             if sapiens_faces is not None:
                 M_o2c = batch_flame_lmk['head_crop']['M_o2c']  # (B, 3, 3)
                 B = sapiens_faces.shape[0]
-                # Check per-frame validity
+                # Check per-frame validity (exclude pshuman)
                 sap_valid = sapiens_faces.abs().sum(dim=(1, 2)) > 0  # (B,)
+                sap_valid = sap_valid & (~is_pshuman)
                 if sap_valid.sum() > 0:
                     # Transform ALL valid sapiens landmarks from original image space to face crop space
                     ones = torch.ones(*sapiens_faces.shape[:-1], 1, device=sapiens_faces.device, dtype=sapiens_faces.dtype)

@@ -108,7 +108,8 @@ def run_video_pipeline(video_name, json_path, args, gpu_id):
         print(f"[GPU {gpu_id}] [{video_name}] Step 1/3: Running track_base...")
         cmd_track_base = [
             sys.executable, 'infer_ehmx_track_base.py'
-        ] + common_args + ['--body_landmark_type', args.body_landmark_type]
+        ] + common_args + ['--body_landmark_type', args.body_landmark_type,
+                          '--body_estimator_type', args.body_estimator_type]
 
         if overwrite_base:
             cmd_track_base.append('--overwrite')
@@ -247,6 +248,12 @@ def main():
     parser.add_argument('--body_landmark_type', type=str, default='sapiens',
                         choices=['sapiens', 'dwpose'],
                         help='Body landmark detector type (default: sapiens)')
+    parser.add_argument('--body_estimator_type', type=str, default='pixie',
+                        choices=['pixie', 'smplerx'],
+                        help='Body estimator type (default: pixie)')
+    parser.add_argument('--video_list', type=str, default=None,
+                        help='Path to a text file with one video name per line. '
+                             'Only process videos in this list.')
     
     args = parser.parse_args()
     
@@ -259,7 +266,14 @@ def main():
     print(f"Index mode: {args.index_mode}")
     
     index_files = find_index_files(args.images_dir, args.index_mode)
-    
+
+    # Filter by video list if provided
+    if args.video_list:
+        with open(args.video_list, 'r') as f:
+            allowed = set(line.strip() for line in f if line.strip() and not line.startswith('#'))
+        index_files = [(v, p) for v, p in index_files if v in allowed]
+        print(f"Filtered to {len(index_files)} video(s) from {args.video_list}")
+
     if not index_files:
         print(f"No index files found in {args.images_dir}")
         return
