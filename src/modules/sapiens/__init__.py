@@ -167,12 +167,46 @@ class SapiensDetector:
         
         return keypoints, scores
 
-    def __call__(self, oriImg):
+    # COCO Wholebody 133 left-right swap pairs: (left_idx, right_idx)
+    _LR_PAIRS = (
+        # Body: eyes, ears, shoulders, elbows, wrists, hips, knees, ankles
+        [(1, 2), (3, 4), (5, 6), (7, 8), (9, 10), (11, 12), (13, 14), (15, 16)] +
+        # Feet: bigtoe, smalltoe, heel
+        [(17, 20), (18, 21), (19, 22)] +
+        # Face contour: 23-39 symmetric around center (31)
+        [(23+i, 39-i) for i in range(8)] +
+        # Face eyebrows: right 40-44 ↔ left 45-49
+        [(40+i, 49-i) for i in range(5)] +
+        # Face nose horizontal: 55↔58, 56↔57
+        [(55, 58), (56, 57)] +
+        # Face eyes: right 59-64 ↔ left 65-70
+        [(59, 65), (60, 70), (61, 69), (62, 68), (63, 67), (64, 66)] +
+        # Face mouth outer: 71↔77, 72↔76, 73↔75, 78↔82, 79↔81
+        [(71, 77), (72, 76), (73, 75), (78, 82), (79, 81)] +
+        # Face mouth inner: 83↔87, 84↔86, 88↔90
+        [(83, 87), (84, 86), (88, 90)] +
+        # Hands: left 91-111 ↔ right 112-132
+        [(91+i, 112+i) for i in range(21)]
+    )
+
+    def _swap_lr(self, keypoints, scores):
+        """Swap left/right keypoint pairs. Coordinates stay the same, indices swap."""
+        kps = keypoints.copy()
+        sc = scores.copy()
+        for l, r in self._LR_PAIRS:
+            kps[l], kps[r] = keypoints[r].copy(), keypoints[l].copy()
+            sc[l], sc[r] = scores[r], scores[l]
+        return kps, sc
+
+    def __call__(self, oriImg, swap_lr=False):
         """Run Sapiens pose detection on an image.
-        
+
         Args:
             oriImg: RGB image (H, W, 3), np.uint8
-            
+            swap_lr: If True, swap left/right keypoint assignments after detection.
+                     Use for horizontally-flipped pshuman back-view images where
+                     Sapiens detects good keypoints but L/R semantics are reversed.
+
         Returns:
             tuple: (det_info, raw_info)
             - det_info: dict with 'bodies', 'hands', 'faces', 'feet', 'bbox'
@@ -180,24 +214,28 @@ class SapiensDetector:
             - raw_info: dict with 'keypoints' (133, 2), 'scores' (133,), 'bbox' (4,)
         """
         H, W = oriImg.shape[:2]
-        
-        # Detect person
+
+        # Detect person (always on the input image for best quality)
         bboxes = self._detect_person(oriImg)
-        
+
         if len(bboxes) == 0:
             # Fallback: use full image as bbox
             bbox = np.array([0, 0, W, H], dtype=np.float32)
         else:
             bbox = self._get_largest_bbox(bboxes)
-        
+
         # Preprocess
         img_tensor, center, scale = self._preprocess(oriImg, bbox)
-        
+
         # Inference
         heatmaps = self._inference(img_tensor)
-        
+
         # Decode
         keypoints, scores = self._decode_and_transform(heatmaps, center, scale)
+
+        # For swap_lr: swap left/right keypoint pairs (coordinates stay the same)
+        if swap_lr:
+            keypoints, scores = self._swap_lr(keypoints, scores)
         
         # Build raw_info (133 keypoints in original image coords)
         raw_info = {

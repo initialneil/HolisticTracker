@@ -19,6 +19,7 @@ class DataPreparationConfig(PrintableConfig):
     sapiens_cfg_path: str = 'src/configs/model_configs/sapiens_config.yaml'
 
     body_landmark_type: str = 'sapiens'  # 'sapiens' or 'dwpose'
+    body_estimator_type: str = 'smplerx'  # 'pixie' or 'smplerx'
 
     kp203_path:       str = 'pretrained/lmk106/landmark.onnx'
     fan_path:         str = 'pretrained/fan/fan_lmk_detector.onnx'
