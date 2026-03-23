@@ -1,5 +1,7 @@
 assets/
 pretrained/
+results/
+data/
 
 # Python
 __pycache__/

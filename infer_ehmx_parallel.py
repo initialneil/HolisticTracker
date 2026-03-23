@@ -254,6 +254,8 @@ def main():
     parser.add_argument('--video_list', type=str, default=None,
                         help='Path to a text file with one video name per line. '
                              'Only process videos in this list.')
+    parser.add_argument('--workers_per_gpu', type=int, default=1,
+                        help='Number of worker processes per GPU (default: 1)')
     
     args = parser.parse_args()
     
@@ -290,16 +292,18 @@ def main():
         task_queue.put((video_name, json_path))
     
     # Add poison pills (one per worker)
-    for _ in gpu_ids:
+    num_workers = len(gpu_ids) * args.workers_per_gpu
+    for _ in range(num_workers):
         task_queue.put(None)
-    
+
     # Start worker processes
-    print(f"\nStarting {len(gpu_ids)} worker process(es)...")
+    print(f"\nStarting {num_workers} worker process(es) ({args.workers_per_gpu} per GPU)...")
     workers = []
     for gpu_id in gpu_ids:
-        p = Process(target=worker_process, args=(gpu_id, task_queue, progress_queue, args))
-        p.start()
-        workers.append(p)
+        for _ in range(args.workers_per_gpu):
+            p = Process(target=worker_process, args=(gpu_id, task_queue, progress_queue, args))
+            p.start()
+            workers.append(p)
     
     # Monitor progress with tqdm
     total_videos = len(index_files)
