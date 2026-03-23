@@ -3,7 +3,7 @@
 </p>
 
 <div align="center">
-  <img src="assets/Docs/visual.gif">
+  <img src="assets/Docs/tracking_examples.jpg">
 </div>
 
 ## Introduction
