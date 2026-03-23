@@ -752,29 +752,40 @@ class TrackBasePipeline:
                 'skip_hands': skip_hands,
             })
 
-        # === Smooth bboxes temporally (standard frames only, pshuman keeps per-frame) ===
-        print(f"  Smoothing bboxes (alpha={bbox_smooth_alpha})...")
+        # === Smooth bboxes temporally per-shot (standard frames only, pshuman keeps per-frame) ===
+        print(f"  Smoothing bboxes per-shot (alpha={bbox_smooth_alpha})...")
         # Separate standard vs pshuman indices
         std_indices = [i for i in range(n) if not frames_data[i].get('skip_face', False)]
         psh_indices = [i for i in range(n) if frames_data[i].get('skip_face', False)]
 
-        # Smooth only standard frame bboxes
-        std_face = [raw_face_bboxes[i] for i in std_indices]
-        std_lhand = [raw_lhand_bboxes[i] for i in std_indices]
-        std_rhand = [raw_rhand_bboxes[i] for i in std_indices]
+        # Group standard indices by shot_id to avoid cross-shot smoothing
+        from collections import OrderedDict
+        shot_groups = OrderedDict()  # shot_id -> list of std frame indices
+        for i in std_indices:
+            frame_key = frames_data[i].get('frame_key', '')
+            shot_id = frame_key.split('/')[0] if '/' in frame_key else ''
+            if shot_id not in shot_groups:
+                shot_groups[shot_id] = []
+            shot_groups[shot_id].append(i)
 
-        smooth_std_face = smooth_bboxes(std_face, alpha=bbox_smooth_alpha)
-        smooth_std_lhand = smooth_bboxes(std_lhand, alpha=bbox_smooth_alpha)
-        smooth_std_rhand = smooth_bboxes(std_rhand, alpha=bbox_smooth_alpha)
-
-        # Build final smoothed arrays: smoothed for standard, raw for pshuman
+        # Smooth bboxes independently within each shot
         smooth_face = [None] * n
         smooth_lhand = [None] * n
         smooth_rhand = [None] * n
-        for j, i in enumerate(std_indices):
-            smooth_face[i] = smooth_std_face[j]
-            smooth_lhand[i] = smooth_std_lhand[j]
-            smooth_rhand[i] = smooth_std_rhand[j]
+        for shot_id, indices in shot_groups.items():
+            shot_face = [raw_face_bboxes[i] for i in indices]
+            shot_lhand = [raw_lhand_bboxes[i] for i in indices]
+            shot_rhand = [raw_rhand_bboxes[i] for i in indices]
+
+            sm_face = smooth_bboxes(shot_face, alpha=bbox_smooth_alpha)
+            sm_lhand = smooth_bboxes(shot_lhand, alpha=bbox_smooth_alpha)
+            sm_rhand = smooth_bboxes(shot_rhand, alpha=bbox_smooth_alpha)
+
+            for j, i in enumerate(indices):
+                smooth_face[i] = sm_face[j]
+                smooth_lhand[i] = sm_lhand[j]
+                smooth_rhand[i] = sm_rhand[j]
+
         for i in psh_indices:
             smooth_face[i] = raw_face_bboxes[i]  # per-frame, no smoothing
             smooth_lhand[i] = raw_lhand_bboxes[i]
