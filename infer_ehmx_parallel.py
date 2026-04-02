@@ -64,6 +64,15 @@ def run_video_pipeline(video_name, json_path, args, gpu_id):
     """
     env = os.environ.copy()
     env['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
+    # Ensure ONNX CUDA provider can find cublas/cudnn libs
+    nvidia_lib = os.path.join(sys.prefix, 'lib/python' + '.'.join(map(str, sys.version_info[:2])),
+                              'site-packages/nvidia')
+    extra_libs = ':'.join(filter(os.path.isdir, [
+        os.path.join(nvidia_lib, 'cublas/lib'),
+        os.path.join(nvidia_lib, 'cudnn/lib'),
+    ]))
+    if extra_libs:
+        env['LD_LIBRARY_PATH'] = extra_libs + ':' + env.get('LD_LIBRARY_PATH', '')
     
     print(f"[GPU {gpu_id}] Starting pipeline for: {video_name}")
     
@@ -120,8 +129,12 @@ def run_video_pipeline(video_name, json_path, args, gpu_id):
         try:
             result = subprocess.run(cmd_track_base, env=env, capture_output=True, text=True)
             if result.returncode != 0:
-                print(f"[GPU {gpu_id}] [{video_name}] ✗ track_base failed:")
-                print(result.stderr)
+                print(f"[GPU {gpu_id}] [{video_name}] ✗ track_base failed (exit={result.returncode}):")
+                # Print last 20 lines of stdout+stderr for diagnosis
+                combined = (result.stdout or '') + '\n' + (result.stderr or '')
+                for line in combined.strip().split('\n')[-20:]:
+                    if line.strip():
+                        print(f"  {line}")
                 return False
             print(f"[GPU {gpu_id}] [{video_name}] ✓ track_base completed")
         except Exception as e:

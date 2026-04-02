@@ -556,49 +556,48 @@ class TrackBasePipeline:
         return ret_images, base_results, mean_shape_results
 
     def track_base_video(self, frames_data, bbox_smooth_alpha=0.5, verbose=False):
-        """Process a video with temporally smoothed face/hand bboxes.
+        """Process a video frame-by-frame (memory-efficient single-pass).
 
-        Two-pass approach:
-          Pass 1: Run Sapiens + body encoder on all frames, collect raw face/hand bboxes
-          Pass 2: Smooth bboxes temporally, then crop and run face/hand encoders
+        Each frame is fully processed (detection + cropping + encoding) before
+        moving to the next, so only one image is in memory at a time.
 
         Args:
             frames_data: list of dicts with keys:
                 'frame_key': str
-                'img_rgb': (H, W, 3) uint8 RGB image
+                'img_rgb': (H, W, 3) uint8 RGB image  (or None if using lazy loading)
+                'load_fn': callable() -> (H,W,3) uint8 (optional, for lazy loading)
                 'skip_face': bool
                 'skip_hands': bool
-            bbox_smooth_alpha: EMA alpha for bbox smoothing (0.5 = moderate)
+            bbox_smooth_alpha: unused (kept for API compatibility)
 
         Returns:
             all_results: dict mapping frame_key -> (ret_images, base_results, mean_shape_results)
         """
+        from .modules.sapiens import LHAND_INDICES, RHAND_INDICES
+
         n = len(frames_data)
+        print(f"  Processing {n} frames (single-pass, memory-efficient)...")
 
-        # === Pass 1: Sapiens detection + body encoding + raw bbox collection ===
-        print(f"  Pass 1: Detecting keypoints and body params ({n} frames)...")
-        pass1_data = []  # stores per-frame intermediate data
-        raw_face_bboxes = []
-        raw_lhand_bboxes = []
-        raw_rhand_bboxes = []
+        all_results = {}
 
-        for fd in tqdm(frames_data, desc="  Pass 1 (Sapiens+body)"):
-            img_rgb = fd['img_rgb']
+        for fd in tqdm(frames_data, desc="  track_base"):
+            # Load image lazily if load_fn provided, otherwise use preloaded
+            if 'load_fn' in fd and fd['load_fn'] is not None:
+                img_rgb = fd['load_fn']()
+            else:
+                img_rgb = fd['img_rgb']
+
             skip_face = fd['skip_face']
             skip_hands = fd['skip_hands']
+            frame_key = fd.get('frame_key')
 
             ret_images = {'ori_image': img_rgb}
             base_results = {}
             mean_shape_results = {}
 
-            # Detect body pose and keypoints
-            # Detect body pose and keypoints
-            # NOTE: pshuman_03 L/R is "wrong" visually but matches make_pshuman_camera(mirror_x)
-            # so we do NOT swap L/R — they're consistent in the optimization
-            frame_key = fd.get('frame_key')
+            # --- Detect body pose and keypoints ---
             det_info, det_raw_info = self.body_lmk_detector(img_rgb)
 
-            # Use full image as bbox (no_body_crop mode)
             h, w = img_rgb.shape[:2]
             det_info['bbox'] = np.array([0, 0, w, h], dtype=np.float32)
 
@@ -630,30 +629,26 @@ class TrackBasePipeline:
             base_results['dwpose_raw'] = det_raw_info
             base_results['dwpose_rlt'] = body_lmk_rlt
 
-            # Hand validity — always compute from Sapiens scores
+            # Hand validity
             base_results['left_hand_valid'] = (
                 body_lmk_rlt['scores'][-42:-21].mean() >= self.cfg.check_hand_score
             )
             base_results['right_hand_valid'] = (
                 body_lmk_rlt['scores'][-21:].mean() >= self.cfg.check_hand_score
             )
-
-            # Check crossing hands
             if ((body_lmk_rlt['keypoints'][-42:-21] -
                  body_lmk_rlt['keypoints'][-21:])**2).mean() < self.cfg.check_hand_dist:
                 base_results['left_hand_valid'] = False
                 base_results['right_hand_valid'] = False
 
-            # Body image and body params (PIXIE or SMPLer-X)
+            # --- Body params (PIXIE or SMPLer-X) ---
             img_crop_body = crop_info['img_crop']
             img_hd = crop_info_hd['img_crop']
             ret_images['body_image'] = img_hd
 
-            frame_key = fd.get('frame_key')
             if self.body_estimator_type == 'smplerx' and frame_key:
                 coeff_param = self._get_smplerx_coeffs(frame_key)
                 if coeff_param is None:
-                    # Fallback: use PIXIE if available, else zero init
                     if self.pixie_encoder is not None:
                         img_crop_t = image2tensor(img_crop_body).to(self.device).unsqueeze(0)
                         img_hd_t = image2tensor(img_hd).to(self.device).unsqueeze(0)
@@ -663,7 +658,6 @@ class TrackBasePipeline:
                         coeff_param['camera_RT_params'] = self.cvt_cam_to_persp_cam_fov_body(coeff_param['body_cam'])
                         coeff_param = {k: v.cpu().numpy() for k, v in coeff_param.items()}
                     else:
-                        # Zero init fallback (shouldn't happen for standard frames)
                         coeff_param = self._zero_smplx_coeffs()
             else:
                 img_crop_t = image2tensor(img_crop_body).to(self.device).unsqueeze(0)
@@ -676,8 +670,10 @@ class TrackBasePipeline:
             base_results['smplx_coeffs'] = coeff_param
             mean_shape_results['smplx_shape'] = coeff_param['shape']
 
-            # Compute square head bbox from body-level keypoints (robust to back-facing)
-            # Indices: 0=nose, 1=l_eye, 2=r_eye, 3=l_ear, 4=r_ear, 5=l_shoulder, 6=r_shoulder
+            # Don't keep large crop arrays — free them now
+            del img_crop_body, img_hd, crop_info['img_crop'], crop_info_hd['img_crop']
+
+            # --- Face bbox from Sapiens keypoints (no smoothing) ---
             HEAD_KP_INDICES = [0, 1, 2, 3, 4]
             SHOULDER_INDICES = [5, 6]
             head_kps = det_raw_info['keypoints'][HEAD_KP_INDICES]
@@ -685,15 +681,12 @@ class TrackBasePipeline:
             shoulder_kps = det_raw_info['keypoints'][SHOULDER_INDICES]
             shoulder_scores = det_raw_info['scores'][SHOULDER_INDICES]
 
-            # Always compute face bbox from body-level keypoints (even for pshuman)
             face_bbox = None
             valid_head = head_scores >= 0.3
             valid_head_kps = head_kps[valid_head]
 
             if len(valid_head_kps) >= 2:
                 center = valid_head_kps.mean(axis=0)
-
-                # Estimate head size from ear-to-ear or keypoint span
                 ear_valid = head_scores[3] >= 0.3 and head_scores[4] >= 0.3
                 if ear_valid:
                     head_width = np.linalg.norm(head_kps[3] - head_kps[4])
@@ -702,17 +695,11 @@ class TrackBasePipeline:
                         valid_head_kps[:, 0].max() - valid_head_kps[:, 0].min(),
                         valid_head_kps[:, 1].max() - valid_head_kps[:, 1].min()
                     )
-
-                head_size = head_width * 1.3
-                head_size = max(head_size, 50)
-
+                head_size = max(head_width * 1.3, 50)
                 face_bbox = np.array([
-                    center[0] - head_size / 2,
-                    center[1] - head_size / 2,
-                    center[0] + head_size / 2,
-                    center[1] + head_size / 2,
+                    center[0] - head_size / 2, center[1] - head_size / 2,
+                    center[0] + head_size / 2, center[1] + head_size / 2,
                 ], dtype=np.float32)
-
             elif np.sum(shoulder_scores >= 0.3) >= 2:
                 valid_sh = shoulder_kps[shoulder_scores >= 0.3]
                 sh_center = valid_sh.mean(axis=0)
@@ -720,151 +707,32 @@ class TrackBasePipeline:
                 head_size = sh_width * 0.7
                 head_center = sh_center - np.array([0, head_size * 1.0])
                 face_bbox = np.array([
-                    head_center[0] - head_size / 2,
-                    head_center[1] - head_size / 2,
-                    head_center[0] + head_size / 2,
-                    head_center[1] + head_size / 2,
+                    head_center[0] - head_size / 2, head_center[1] - head_size / 2,
+                    head_center[0] + head_size / 2, head_center[1] + head_size / 2,
                 ], dtype=np.float32)
 
-            raw_face_bboxes.append(face_bbox)
-
-            # Compute hand bboxes from Sapiens hand keypoints
-            from .modules.sapiens import LHAND_INDICES, RHAND_INDICES
-            lhand_kps = det_raw_info['keypoints'][LHAND_INDICES]
-            rhand_kps = det_raw_info['keypoints'][RHAND_INDICES]
-            lhand_scores = det_raw_info['scores'][LHAND_INDICES]
-            rhand_scores = det_raw_info['scores'][RHAND_INDICES]
-
-            # Always compute hand bboxes from Sapiens (even for pshuman)
-            lhand_bbox = bbox_from_keypoints(lhand_kps, lhand_scores, vis_threshold=0.3, padding=0.3)
-            rhand_bbox = bbox_from_keypoints(rhand_kps, rhand_scores, vis_threshold=0.3, padding=0.3)
-            raw_lhand_bboxes.append(lhand_bbox)
-            raw_rhand_bboxes.append(rhand_bbox)
-
-            pass1_data.append({
-                'img_rgb': img_rgb,
-                'ret_images': ret_images,
-                'base_results': base_results,
-                'mean_shape_results': mean_shape_results,
-                'det_info': det_info,
-                'det_raw_info': det_raw_info,
-                'skip_face': skip_face,
-                'skip_hands': skip_hands,
-            })
-
-        # === Smooth bboxes temporally per-shot (standard frames only, pshuman keeps per-frame) ===
-        print(f"  Smoothing bboxes per-shot (alpha={bbox_smooth_alpha})...")
-        # Separate standard vs pshuman indices
-        std_indices = [i for i in range(n) if not frames_data[i].get('skip_face', False)]
-        psh_indices = [i for i in range(n) if frames_data[i].get('skip_face', False)]
-
-        # Group standard indices by shot_id to avoid cross-shot smoothing
-        from collections import OrderedDict
-        shot_groups = OrderedDict()  # shot_id -> list of std frame indices
-        for i in std_indices:
-            frame_key = frames_data[i].get('frame_key', '')
-            shot_id = frame_key.split('/')[0] if '/' in frame_key else ''
-            if shot_id not in shot_groups:
-                shot_groups[shot_id] = []
-            shot_groups[shot_id].append(i)
-
-        # Smooth bboxes independently within each shot
-        smooth_face = [None] * n
-        smooth_lhand = [None] * n
-        smooth_rhand = [None] * n
-        for shot_id, indices in shot_groups.items():
-            shot_face = [raw_face_bboxes[i] for i in indices]
-            shot_lhand = [raw_lhand_bboxes[i] for i in indices]
-            shot_rhand = [raw_rhand_bboxes[i] for i in indices]
-
-            sm_face = smooth_bboxes(shot_face, alpha=bbox_smooth_alpha)
-            sm_lhand = smooth_bboxes(shot_lhand, alpha=bbox_smooth_alpha)
-            sm_rhand = smooth_bboxes(shot_rhand, alpha=bbox_smooth_alpha)
-
-            for j, i in enumerate(indices):
-                smooth_face[i] = sm_face[j]
-                smooth_lhand[i] = sm_lhand[j]
-                smooth_rhand[i] = sm_rhand[j]
-
-        for i in psh_indices:
-            smooth_face[i] = raw_face_bboxes[i]  # per-frame, no smoothing
-            smooth_lhand[i] = raw_lhand_bboxes[i]
-            smooth_rhand[i] = raw_rhand_bboxes[i]
-
-        # === Pass 2: Crop faces, run pixel3dmm (video track for std, per-frame for pshuman) ===
-        print(f"  Pass 2: Face/hand crops + encoders ({n} frames)...")
-
-        # Step 2a: Crop all faces first
-        face_crop_infos = []
-        for i, fd in enumerate(pass1_data):
-            img_rgb = fd['img_rgb']
-            det_info = fd['det_info']
-            face_bbox = smooth_face[i]
+            # --- Face crop and encoding ---
             if face_bbox is not None:
-                crop_info = crop_image_by_bbox(
+                face_crop_info = crop_image_by_bbox(
                     img_rgb, face_bbox,
                     dsize=self.cfg.head_crop_size, scale=1.2
                 )
             else:
-                crop_info = crop_image(
+                face_crop_info = crop_image(
                     img_rgb, det_info['faces'],
                     dsize=self.cfg.head_crop_size, scale=1.75
                 )
-            face_crop_infos.append(crop_info)
-
-        # Step 2b: Detect landmarks, then run pixel3dmm per-frame for all crops
-        flame_coeffs_list = [None] * n
-        if self.pixel3dmm_encoder is not None:
-            all_crops = [face_crop_infos[i]['img_crop'] for i in range(n)]
-            # Detect 68 face landmarks for each crop (used to constrain pixel3dmm optimization)
-            all_landmarks = []
-            for i in range(n):
-                t_img = all_crops[i].transpose((2, 0, 1)).astype(np.float32)
-                lmk70 = self.lmk70_detector.run(t_img[None] / 255.)['pts'] * 2  # (70, 2) in 512 coords
-                all_landmarks.append(lmk70[:68])  # take first 68 (iBUG format)
-            print(f"  Running pixel3dmm per-frame on {n} frames (with landmark constraint)...")
-            for i in range(n):
-                flame_coeffs_list[i] = self.pixel3dmm_encoder(all_crops[i], landmarks_2d=all_landmarks[i])
-
-        # Step 2c: Process each frame — landmarks, flame params, hand crops
-        all_results = {}
-
-        for i, fd in enumerate(tqdm(pass1_data, desc="  Pass 2 (face+hands)")):
-            img_rgb = fd['img_rgb']
-            ret_images = fd['ret_images']
-            base_results = fd['base_results']
-            mean_shape_results = fd['mean_shape_results']
-            skip_face = fd['skip_face']
-            det_info = fd['det_info']
-
-            frame_key = frames_data[i]['frame_key']
-            crop_info = face_crop_infos[i]
 
             base_results['head_crop'] = {
-                'M_o2c': crop_info['M_o2c'], 'M_c2o': crop_info['M_c2o']
+                'M_o2c': face_crop_info['M_o2c'], 'M_c2o': face_crop_info['M_c2o']
             }
-            ret_images['head_image'] = crop_info['img_crop']
+            ret_images['head_image'] = face_crop_info['img_crop']
 
-            # Save verbose debug info
-            if verbose:
-                det_raw_info = fd['det_raw_info']
-                base_results['_debug'] = {
-                    'sapiens_keypoints': det_raw_info['keypoints'].copy(),
-                    'sapiens_scores': det_raw_info['scores'].copy(),
-                    'raw_face_bbox': raw_face_bboxes[i].copy() if raw_face_bboxes[i] is not None else None,
-                    'smooth_face_bbox': smooth_face[i].copy() if smooth_face[i] is not None else None,
-                    'raw_lhand_bbox': raw_lhand_bboxes[i].copy() if raw_lhand_bboxes[i] is not None else None,
-                    'smooth_lhand_bbox': smooth_lhand[i].copy() if smooth_lhand[i] is not None else None,
-                    'raw_rhand_bbox': raw_rhand_bboxes[i].copy() if raw_rhand_bboxes[i] is not None else None,
-                    'smooth_rhand_bbox': smooth_rhand[i].copy() if smooth_rhand[i] is not None else None,
-                    'used_bbox_crop': smooth_face[i] is not None,
-                }
-
-            # Detect face landmarks (only meaningful for front-facing)
-            lmk203 = self.landmark_runner.run(crop_info['img_crop'])['pts']
-            t_img = crop_info['img_crop'].transpose((2, 0, 1)).astype(np.float32)
+            # Face landmarks
+            lmk203 = self.landmark_runner.run(face_crop_info['img_crop'])['pts']
+            t_img = face_crop_info['img_crop'].transpose((2, 0, 1)).astype(np.float32)
             lmk70 = self.lmk70_detector.run(t_img[None] / 255.)['pts'] * 2
-            lmk_mp = self.mp_detector.run(crop_info['img_crop'])['pts']
+            lmk_mp = self.mp_detector.run(face_crop_info['img_crop'])['pts']
 
             if skip_face or lmk203 is None or lmk_mp is None or lmk70 is None:
                 base_results.update({
@@ -874,12 +742,9 @@ class TrackBasePipeline:
                     'head_lmk_valid': False
                 })
             else:
-                if len(lmk203.shape) == 3:
-                    lmk203 = lmk203[0]
-                if len(lmk70.shape) == 3:
-                    lmk70 = lmk70[0]
-                if len(lmk_mp.shape) == 3:
-                    lmk_mp = lmk_mp[0]
+                if len(lmk203.shape) == 3: lmk203 = lmk203[0]
+                if len(lmk70.shape) == 3: lmk70 = lmk70[0]
+                if len(lmk_mp.shape) == 3: lmk_mp = lmk_mp[0]
                 base_results.update({
                     'head_lmk_203': lmk203,
                     'head_lmk_70': lmk70,
@@ -889,9 +754,8 @@ class TrackBasePipeline:
 
             # FLAME parameters
             if self.teaser_encoder is not None:
-                # TEASER: feed-forward prediction (fast, good orientation)
                 cropped_image = cv2.resize(
-                    crop_info['img_crop'],
+                    face_crop_info['img_crop'],
                     (self.cfg.teaser_input_size, self.cfg.teaser_input_size)
                 )
                 cropped_image = np.transpose(cropped_image, (2, 0, 1))[None, ...] / 255.0
@@ -901,9 +765,9 @@ class TrackBasePipeline:
                 ).numpy()
                 coeff_param['_projected_verts_2d'] = self.project_flame_to_crop_teaser(
                     coeff_param, crop_size=self.cfg.head_crop_size)
-            elif flame_coeffs_list[i] is not None:
-                # pixel3dmm: iterative optimization (pre-computed above)
-                coeff_param = flame_coeffs_list[i]
+            elif self.pixel3dmm_encoder is not None:
+                lmk68 = lmk70[:68] if lmk70 is not None else None
+                coeff_param = self.pixel3dmm_encoder(face_crop_info['img_crop'], landmarks_2d=lmk68)
                 coeff_param['camera_RT_params'] = self.cvt_cam_to_persp_cam_fov(
                     torch.from_numpy(coeff_param['cam'])
                 ).numpy()
@@ -912,22 +776,27 @@ class TrackBasePipeline:
             base_results['flame_coeffs'] = coeff_param
             mean_shape_results['flame_shape'] = coeff_param['shape_params']
 
-            # --- Hand crops using smoothed Sapiens bboxes ---
+            # --- Hand crops and encoding ---
             all_hands_kps = det_info['hands']
             hand_kps_l = all_hands_kps[0]
             hand_kps_r = all_hands_kps[1]
             hand_crop_size = self.cfg.hand_crop_size
 
+            lhand_kps = det_raw_info['keypoints'][LHAND_INDICES]
+            rhand_kps = det_raw_info['keypoints'][RHAND_INDICES]
+            lhand_scores = det_raw_info['scores'][LHAND_INDICES]
+            rhand_scores = det_raw_info['scores'][RHAND_INDICES]
+            lhand_bbox = bbox_from_keypoints(lhand_kps, lhand_scores, vis_threshold=0.3, padding=0.3)
+            rhand_bbox = bbox_from_keypoints(rhand_kps, rhand_scores, vis_threshold=0.3, padding=0.3)
+
             # Left hand
-            lhand_bbox = smooth_lhand[i]
             if lhand_bbox is not None:
-                crop_info = crop_image_by_bbox(
+                lh_crop = crop_image_by_bbox(
                     img_rgb, lhand_bbox, lmk=hand_kps_l,
                     scale=1.2, dsize=hand_crop_size
                 )
-                ret_images['left_hand_image'] = crop_info['img_crop']
-
-                t_img = cv2.flip(crop_info['img_crop'], 1)  # left hand flipped for HAMER
+                ret_images['left_hand_image'] = lh_crop['img_crop']
+                t_img = cv2.flip(lh_crop['img_crop'], 1)
                 cropped_image = np.transpose(t_img, (2, 0, 1))[None, ...] / 255.0
                 coeff_param = self.hamer_encoder(cropped_image.astype(np.float32))
                 coeff_param['camera_RT_params'] = self.cvt_cam_to_persp_cam_fov(
@@ -937,14 +806,12 @@ class TrackBasePipeline:
                     coeff_param, is_left=True, crop_size=hand_crop_size)
                 base_results['left_mano_coeffs'] = coeff_param
                 base_results['left_hand_crop'] = {
-                    'M_o2c': crop_info['M_o2c'], 'M_c2o': crop_info['M_c2o']
+                    'M_o2c': lh_crop['M_o2c'], 'M_c2o': lh_crop['M_c2o']
                 }
                 base_results['left_hand_valid'] = True
                 mean_shape_results['left_mano_shape'] = coeff_param['betas']
             else:
-                # No valid Sapiens hand keypoints — use blank crop
                 ret_images['left_hand_image'] = np.zeros((hand_crop_size, hand_crop_size, 3), dtype=np.uint8)
-                # Feed blank image through HAMER for default coefficients
                 blank = np.zeros((1, 3, hand_crop_size, hand_crop_size), dtype=np.float32)
                 coeff_param = self.hamer_encoder(blank)
                 coeff_param['camera_RT_params'] = self.cvt_cam_to_persp_cam_fov(
@@ -959,15 +826,13 @@ class TrackBasePipeline:
                 mean_shape_results['left_mano_shape'] = coeff_param['betas']
 
             # Right hand
-            rhand_bbox = smooth_rhand[i]
             if rhand_bbox is not None:
-                crop_info = crop_image_by_bbox(
+                rh_crop = crop_image_by_bbox(
                     img_rgb, rhand_bbox, lmk=hand_kps_r,
                     scale=1.2, dsize=hand_crop_size
                 )
-                ret_images['right_hand_image'] = crop_info['img_crop']
-
-                cropped_image = np.transpose(crop_info['img_crop'], (2, 0, 1))[None, ...] / 255.0
+                ret_images['right_hand_image'] = rh_crop['img_crop']
+                cropped_image = np.transpose(rh_crop['img_crop'], (2, 0, 1))[None, ...] / 255.0
                 coeff_param = self.hamer_encoder(cropped_image.astype(np.float32))
                 coeff_param['camera_RT_params'] = self.cvt_cam_to_persp_cam_fov(
                     torch.from_numpy(coeff_param['pred_cam'])
@@ -976,7 +841,7 @@ class TrackBasePipeline:
                     coeff_param, is_left=False, crop_size=hand_crop_size)
                 base_results['right_mano_coeffs'] = coeff_param
                 base_results['right_hand_crop'] = {
-                    'M_o2c': crop_info['M_o2c'], 'M_c2o': crop_info['M_c2o']
+                    'M_o2c': rh_crop['M_o2c'], 'M_c2o': rh_crop['M_c2o']
                 }
                 base_results['right_hand_valid'] = True
                 mean_shape_results['right_mano_shape'] = coeff_param['betas']
@@ -996,6 +861,9 @@ class TrackBasePipeline:
                 mean_shape_results['right_mano_shape'] = coeff_param['betas']
 
             all_results[frame_key] = (ret_images, base_results, mean_shape_results)
+
+            # Free the source image — only crop transforms + coefficients are kept
+            del img_rgb
 
         return all_results
 

@@ -15,8 +15,8 @@ from tqdm import tqdm
 class Args:
     dataset_dir: str = '/home/szj/Datasets/TEDWB1k/shots_ehmx'
     test_list: str = '/home/szj/Datasets/TEDWB1k/test.txt'
-    images_dir: str = '/home/szj/Datasets/TEDWB1k/shots_images'
-    mattes_dir: str = '/home/szj/Datasets/TEDWB1k/shots_rmbg2'
+    frames_root: str = '/home/szj/Datasets/TEDWB1k/shots_images'
+    matte_root: str = '/home/szj/Datasets/TEDWB1k/shots_rmbg2'
     num_val: int = 20
     max_shots_val_test: int = 2  # limit shots per video in val/test splits (0 = no limit)
 
@@ -61,8 +61,8 @@ if __name__ == '__main__':
     }
     full_extra_info = {
         'wbbox_info': {},
-        'images_dir': args.images_dir,
-        'mattes_dir': args.mattes_dir,
+        'frames_root': args.frames_root,
+        'matte_root': args.matte_root,
     }
     full_tracking_data = {}
     full_id_share_data = {}

@@ -40,29 +40,37 @@ def process_video(video_name, video_data, args, pipeline):
     print(f"\nProcessing video: {video_name}")
     print(f"  Frames: {frames_num} ({len(frames_keys)} with pshuman)")
 
-    # Load all images first
+    # Build lazy-loading frame descriptors (images loaded one at a time)
     frames_data = []
     for frame_key in frames_keys:
-        img_rgb = load_frame_image(args.images_dir, video_name, frame_key, args.pshuman_dir)
+        # Verify frame exists before adding
+        img_path = os.path.join(args.images_dir, video_name, f"{frame_key}.png")
+        if not os.path.exists(img_path):
+            img_path = os.path.join(args.images_dir, video_name, f"{frame_key}.jpg")
+        if 'pshuman' in frame_key and hasattr(args, 'pshuman_dir') and args.pshuman_dir:
+            img_path = os.path.join(args.pshuman_dir, video_name, f"{frame_key}.png")
 
-        if img_rgb is None:
-            print(f"  Warning: Failed to load frame: {frame_key}")
+        if not os.path.exists(img_path):
+            print(f"  Warning: Frame not found: {frame_key}")
             continue
 
-        # Apply matte if available
-        if args.mattes_dir:
-            matte_path = os.path.join(args.mattes_dir, video_name, f"{frame_key}.png")
-            matte = load_matte(matte_path)
-            if matte is not None:
-                img_rgb = apply_matte_to_image(img_rgb, matte)
+        def make_loader(_fk=frame_key, _vn=video_name):
+            """Lazy loader — reads image from disk only when called."""
+            img = load_frame_image(args.images_dir, _vn, _fk,
+                                   getattr(args, 'pshuman_dir', None))
+            if img is not None and args.mattes_dir:
+                matte_path = os.path.join(args.mattes_dir, _vn, f"{_fk}.png")
+                matte = load_matte(matte_path)
+                if matte is not None:
+                    img = apply_matte_to_image(img, matte)
+            return img
 
-        skip_face = skip_hands = False
-        if 'pshuman' in frame_key:
-            skip_face = skip_hands = True
+        skip_face = skip_hands = 'pshuman' in frame_key
 
         frames_data.append({
             'frame_key': frame_key,
-            'img_rgb': img_rgb,
+            'img_rgb': None,
+            'load_fn': make_loader,
             'skip_face': skip_face,
             'skip_hands': skip_hands,
         })
@@ -74,10 +82,9 @@ def process_video(video_name, video_data, args, pipeline):
     # Use video-level processing with bbox smoothing
     all_results = pipeline.track_base_video(frames_data, bbox_smooth_alpha=0.5, verbose=getattr(args, 'verbose', False))
 
-    # Reorganize results
+    # Reorganize results — don't keep ret_images (large) in memory
     base_results = {}
     id_share_params = {}
-    ret_images_dict = {}
 
     shape_accum = {
         'smplx_shape': [],
@@ -88,11 +95,14 @@ def process_video(video_name, video_data, args, pipeline):
 
     for frame_key, (ret_images, frame_base_results, mean_shape_results) in all_results.items():
         base_results[frame_key] = frame_base_results
-        ret_images_dict[frame_key] = ret_images
+        # Don't keep ret_images — visualization will reconstruct from transforms
 
         for key in shape_accum:
             if key in mean_shape_results:
                 shape_accum[key].append(mean_shape_results[key])
+
+    # Free all_results to release any remaining image references
+    del all_results
 
     print(f"  Successfully processed {len(base_results)}/{frames_num} frames")
 
@@ -101,7 +111,7 @@ def process_video(video_name, video_data, args, pipeline):
         if len(values) > 0:
             id_share_params[key] = np.mean(values, axis=0)
 
-    return base_results, id_share_params, ret_images_dict
+    return base_results, id_share_params, {}
 
 
 def save_results(video_name, base_results, id_share_params, out_dir, info):
@@ -280,14 +290,14 @@ def main():
         else:
             print(f"\nProcessing {video_name} (no existing base_tracking.pkl)")
             
-        base_results, id_share_params, ret_images_dict = process_video(
+        base_results, id_share_params, _ = process_video(
             video_name, video_data, args, pipeline
         )
-        
+
         if len(base_results) == 0:
             print(f"  Warning: No frames processed for {video_name}")
             continue
-        
+
         # Save results
         info = {
             'images_dir': args.images_dir,
@@ -296,9 +306,23 @@ def main():
             'fps': video_data.get('fps', 24)
         }
         save_results(video_name, base_results, id_share_params, args.ehmx_dir, info)
-        
-        # Generate visualization with landmarks
+
+        # Generate visualization by reconstructing crops from saved transforms
+        # (memory-efficient: loads one frame at a time)
+        frames_keys = video_data['frames_keys']
+        ret_images_dict = {}
+        for frame_key in frames_keys:
+            if frame_key not in base_results:
+                continue
+            img_rgb = load_frame_image(args.images_dir, video_name, frame_key,
+                                       getattr(args, 'pshuman_dir', None))
+            if img_rgb is not None:
+                ret_images_dict[frame_key] = pipeline.reconstruct_cropped_images(
+                    img_rgb, base_results[frame_key]
+                )
+                del img_rgb
         generate_visualization(video_name, video_data, ret_images_dict, base_results, args.ehmx_dir, pipeline)
+        del ret_images_dict
     
     print("\nProcessing complete!")
 
