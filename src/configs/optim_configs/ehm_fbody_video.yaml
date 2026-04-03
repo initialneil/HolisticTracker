@@ -1,117 +1,119 @@
-# no body crop for scan, use full image w/ gt camera
-no_body_crop: false
-# reset to use base track results
+# Video tracking config — based on ehm_fbody_ytb.yaml
+# with stronger temporal smoothing in round1 for visual quality
+no_body_crop: true
 reset_to_base_track: true
 
 optim_flame:
-  steps: 501
+  steps: 301
   share_id: true
-
-  # mini batch for video
   mini_batch_size: 1024
   share_pose: false
 
-  # Loss weights for FLAME optimization
   lambda_lmk_2d: 1.0
   lambda_lmk_203: 1.0
   lambda_shape_reg: 0.01
   lambda_exp_reg: 0.01
   lambda_pose_reg: 1.0
+  lambda_motion_reg: 0.01
 
-  # motion reg for video
-  lambda_motion_reg: 10.0
-
+# Stage 1: Coarse alignment — strong temporal smoothing, moderate regularization
 optim_ehm_round0:
-  steps: 301  # 1001
+  steps: 501
   share_id: true
-
-  # mini batch for video
   mini_batch_size: 1024
   share_pose: false
-
-  # optim
   optim_camera: true
 
-  # Loss weights for EHM/SMPL-X optimization
-  lambda_3d_head: 10.0
+  lambda_3d_head: 50.0
   lambda_3d_hand_l: 10.0
   lambda_3d_hand_r: 10.0
   lambda_3d_z: 0.1
-  lambda_2d_kpt: 10.0
-  lambda_2d_knee_feet: 100.0  # 10.0x of lambda_2d_kpt
+  lambda_2d_kpt: 20.0
+  lambda_2d_knee_feet: 200.0
 
   lambda_prior: 1.0
-  lambda_smplx_shape_reg: 0.1
+  lambda_smplx_shape_reg: 0.01
   lambda_mano_shape_reg: 0.1
-  lambda_scale_reg: 100.0
-  lambda_joint_offset_reg: 1.0
+  lambda_scale_reg: 10.0
+  lambda_joint_offset_reg: 0.1
 
-  # regularize change from init pose
-  lambda_smplx_pose: 10.0
-  lambda_smplx_init: 10.0  # Weight for regularizing invalid hands/face towards init pose
-
-  # invisible lower-body regularization
+  lambda_smplx_pose: 5.0
+  lambda_smplx_init: 10.0
   lambda_smplx_pose_reg_base: 1.0
   lambda_smplx_leg_pose: 1.0
   lambda_smplx_freezed_pose: 1.0
-
-  # hand
   lambda_smplx_hand_pose_reg: 0.1
 
-  # temporal motion
-  lambda_mtn_body_pose: 1.0
-  lambda_mtn_hand_pose: 1.0
-  lambda_mtn_rot6d: 1.0
-  lambda_mtn_trans: 1.0
-  lambda_mtn_trans_z: 1.0
-  lambda_mtn_vertices: 1.0
+  lambda_mtn_body_pose: 100.0
+  lambda_mtn_rot6d: 100.0
+  lambda_mtn_trans: 100.0
+  lambda_mtn_trans_z: 100.0
+  lambda_mtn_vertices: 10.0
 
+# Stage 2: Detail fitting — same as ytb, accurate per-frame
 optim_ehm_round1:
-  steps: 201  # 1001
+  steps: 501
   share_id: true
-
-  # mini batch for video
   mini_batch_size: 1024
   share_pose: false
-
-  # optim
   optim_camera: true
 
-  # Loss weights for EHM/SMPL-X optimization
-  lambda_3d_head: 1.0
-  lambda_3d_hand_l: 1.0
-  lambda_3d_hand_r: 1.0
+  lambda_3d_head: 100.0
+  lambda_3d_hand_l: 20.0
+  lambda_3d_hand_r: 20.0
   lambda_3d_z: 0.1
-  lambda_2d_kpt: 1.0
-  lambda_2d_knee_feet: 10.0  # 10.0x of lambda_2d_kpt
+  lambda_2d_kpt: 50.0
+  lambda_2d_knee_feet: 500.0
 
-  lambda_prior: 1.0
-  lambda_smplx_shape_reg: 0.1
+  lambda_prior: 0.1
+  lambda_smplx_shape_reg: 0.01
   lambda_mano_shape_reg: 0.1
-  lambda_scale_reg: 100.0
-  lambda_joint_offset_reg: 1.0
+  lambda_scale_reg: 10.0
+  lambda_joint_offset_reg: 0.01
 
-  # regularize change from init pose
   lambda_smplx_pose: 1.0
-  lambda_smplx_init: 1.0  # Weight for regularizing invalid hands/face towards init pose
-
-  # invisible lower-body regularization
+  lambda_smplx_init: 10.0
   lambda_smplx_pose_reg_base: 1.0
   lambda_smplx_leg_pose: 1.0
   lambda_smplx_freezed_pose: 1.0
-
-  # hand
   lambda_smplx_hand_pose_reg: 0.1
 
-  # temporal motion
+  lambda_mtn_body_pose: 30.0
+  lambda_mtn_rot6d: 30.0
+  lambda_mtn_trans: 30.0
+  lambda_mtn_trans_z: 30.0
+  lambda_mtn_vertices: 10.0
+
+# Stage 3: Temporal smoothing — strong motion regularization for visual quality
+optim_ehm_round2:
+  steps: 301
+  share_id: true
+  mini_batch_size: 1024
+  share_pose: false
+  optim_camera: true
+
+  lambda_3d_head: 100.0
+  lambda_3d_hand_l: 20.0
+  lambda_3d_hand_r: 20.0
+  lambda_3d_z: 0.1
+  lambda_2d_kpt: 50.0
+  lambda_2d_knee_feet: 500.0
+
+  lambda_prior: 0.1
+  lambda_smplx_shape_reg: 0.01
+  lambda_mano_shape_reg: 0.1
+  lambda_scale_reg: 10.0
+  lambda_joint_offset_reg: 0.01
+
+  lambda_smplx_pose: 1.0
+  lambda_smplx_init: 10.0
+  lambda_smplx_pose_reg_base: 1.0
+  lambda_smplx_leg_pose: 1.0
+  lambda_smplx_freezed_pose: 1.0
+  lambda_smplx_hand_pose_reg: 0.1
+
   lambda_mtn_body_pose: 200.0
-  lambda_mtn_hand_pose: 200.0
   lambda_mtn_rot6d: 100.0
   lambda_mtn_trans: 100.0
   lambda_mtn_trans_z: 100.0
   lambda_mtn_vertices: 20.0
-
-# After reseating the processor and heatsink, the system boots successfully into Windows.
-
-
-
