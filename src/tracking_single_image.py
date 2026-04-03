@@ -217,6 +217,7 @@ class DataPreparePipeline(object):
         out_dir = args.output_dir
         log(str(get_machine_info()))
         self.args=args
+        optim_cfg = load_config(args.optim_cfg)
         ######## process driving info ########
         for image_idx, image_fp in enumerate(args.input_dir):
             image_name = self.get_image_name(image_fp, 1)
@@ -310,7 +311,12 @@ class DataPreparePipeline(object):
                     if self.cfg.fit_flame:
                         self.flame_opt.saving_root=saving_root
                         log(f"[{image_idx:04d}/{len(args.input_dir)}] Refining head parameters: {image_name}")
-                        opt_flame_coeff,id_share_params_results = self.flame_opt.run(optimized_result,id_share_params_results,lmdb_engine,steps=201)
+                        optim_flame_cfg = dict(optim_cfg.optim_flame)
+                        optim_flame_cfg['steps'] = 201
+                        opt_flame_coeff,id_share_params_results = self.flame_opt.run(
+                            optimized_result, id_share_params_results, optim_flame_cfg,
+                            lmdb_engine, 1,
+                        )
                         for key in base_results.keys():
                             base_results[key]['flame_coeffs'] = opt_flame_coeff[key]
                         write_dict_pkl(optim_track_fp_flame, base_results)
@@ -325,7 +331,12 @@ class DataPreparePipeline(object):
                     if self.cfg.fit_ehm:
                         self.ehm_opt.saving_root=saving_root
                         log(f"[{image_idx:04d}/{len(args.input_dir)}] Refining ehm-smplx parameters: {image_name}")
-                        opt_smplx_coeff,id_share_params_results = self.ehm_opt.run(optimized_result,id_share_params_results,lmdb_engine,steps=101)
+                        optim_ehm_cfg = dict(optim_cfg.optim_ehm)
+                        optim_ehm_cfg['steps'] = 101
+                        opt_smplx_coeff,id_share_params_results = self.ehm_opt.run(
+                            optimized_result, id_share_params_results, optim_ehm_cfg,
+                            lmdb_engine, 1,
+                        )
                         for key in base_results.keys():
                             optimized_result[key]['smplx_coeffs'] = opt_smplx_coeff[key]
                             del optimized_result[key]['left_mano_coeffs']['betas'] #shape

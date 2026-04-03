@@ -531,6 +531,7 @@ class DataPreparePipeline(object):
         out_dir = args.output_dir
         log(str(get_machine_info()))
         self.args=args
+        optim_cfg = load_config(args.optim_cfg)
         for video_idx, video_fp in enumerate(args.source_dir):
             video_name = self.get_video_name(video_fp, 1)
             saving_root = osp.join(out_dir, video_name)
@@ -616,7 +617,10 @@ class DataPreparePipeline(object):
                     if self.cfg.fit_flame:
                         self.flame_opt.saving_root=saving_root
                         log(f"[{video_idx:04d}/{len(args.source_dir)}] Refining head parameters: {video_name}")
-                        opt_flame_coeff,id_share_params_results = self.flame_opt.run(optimized_result,id_share_params_results,lmdb_engine,frame_interval)
+                        opt_flame_coeff,id_share_params_results = self.flame_opt.run(
+                            optimized_result, id_share_params_results, optim_cfg.optim_flame,
+                            lmdb_engine, frame_interval,
+                        )
                         for key in base_results.keys():
                             base_results[key]['flame_coeffs'] = opt_flame_coeff[key]
                         write_dict_pkl(optim_track_fp_flame, base_results)
@@ -630,7 +634,10 @@ class DataPreparePipeline(object):
                     if self.cfg.fit_ehm:
                         self.ehm_opt.saving_root=saving_root
                         log(f"[{video_idx:04d}/{len(args.source_dir)}] Refining ehm-smplx parameters: {video_name}")
-                        opt_smplx_coeff,id_share_params_results = self.ehm_opt.run(optimized_result,id_share_params_results,lmdb_engine,frame_interval)
+                        opt_smplx_coeff,id_share_params_results = self.ehm_opt.run(
+                            optimized_result, id_share_params_results, optim_cfg.optim_ehm,
+                            lmdb_engine, frame_interval,
+                        )
                         for key in base_results.keys():
                             optimized_result[key]['smplx_coeffs'] = opt_smplx_coeff[key]
                             del optimized_result[key]['left_mano_coeffs']['betas']
