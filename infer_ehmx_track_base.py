@@ -207,7 +207,7 @@ def main():
     parser.add_argument('--body_landmark_type', type=str, default='sapiens',
                         choices=['sapiens', 'dwpose'],
                         help='Body landmark detector type (default: sapiens)')
-    parser.add_argument('--body_estimator_type', type=str, default='smplerx',
+    parser.add_argument('--body_estimator_type', type=str, default='pixie',
                         choices=['pixie', 'smplerx'],
                         help='Body estimator type (default: smplerx)')
     parser.add_argument('--overwrite', action='store_true',
