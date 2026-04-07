@@ -94,23 +94,6 @@ python merge_ehmx_dataset.py \
 
 This produces `optim_tracking_ehm.pkl`, `id_share_params.pkl`, `videos_info.json`, `dataset_frames.json`, and `extra_info.json` for use with HolisticAvatar's `TrackedData` loader.
 
-## Citation
-
-```bibtex
-@article{HolisticAvatar,
-  title={HolisticAvatar},
-  author={Zhang, Dongbin and Liu, Yunfei and Lin, Lijian and Zhu, Ye and Li, Yang and Qin, Minghan and Li, Yu and Wang, Haoqian},
-  year={2025}
-}
-
-@article{GUAVA,
-  title={GUAVA: Generalizable Upper Body 3D Gaussian Avatar},
-  author={Zhang, Dongbin and Liu, Yunfei and Lin, Lijian and Zhu, Ye and Li, Yang and Qin, Minghan and Li, Yu and Wang, Haoqian},
-  journal={arXiv preprint arXiv:2505.03351},
-  year={2025}
-}
-```
-
 ## License
 
 This project is released under the [MIT License](LICENSE).

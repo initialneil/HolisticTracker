@@ -211,21 +211,6 @@ Please read these before training — they affect what is and isn't reliable in 
 - **Audio.** Per-shot `audio.wav` files are included inside `frames.tar` for future audio-driven work (talking-head, lip-sync, etc.). They are NOT used by HolisticAvatar.
 - **The original frames are stored as JPG** at the source resolution from `yt-dlp` of the TED talks. We did not re-encode.
 
-## Citation
-
-If you use TEDWB1k, please cite the HolisticAvatar paper and the HolisticTracker repository:
-
-```bibtex
-@misc{tedwb1k2026,
-  title  = {TEDWB1k: 1.4K TED Talks with Whole-Body SMPL-X + FLAME Tracking},
-  author = {neil},
-  year   = {2026},
-  url    = {https://huggingface.co/datasets/initialneil/TEDWB1k},
-}
-```
-
-And acknowledge the source content (TED, talks under CC-BY-NC-ND) in any derivative work.
-
 ## License
 
 [**CC-BY-NC-4.0**](https://creativecommons.org/licenses/by-nc/4.0/). Non-commercial research use only. Attribution required.
