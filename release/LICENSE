@@ -1,0 +1,41 @@
+Creative Commons Attribution-NonCommercial 4.0 International (CC-BY-NC-4.0)
+
+Copyright (c) 2026 neil
+
+This dataset is licensed under the Creative Commons Attribution-NonCommercial 4.0
+International License. To view a copy of this license, visit
+
+    https://creativecommons.org/licenses/by-nc/4.0/
+
+or send a letter to Creative Commons, PO Box 1866, Mountain View, CA 94042, USA.
+
+You are free to:
+  - Share — copy and redistribute the material in any medium or format
+  - Adapt — remix, transform, and build upon the material
+
+Under the following terms:
+  - Attribution — You must give appropriate credit, provide a link to the
+    license, and indicate if changes were made. You may do so in any reasonable
+    manner, but not in any way that suggests the licensor endorses you or your use.
+  - NonCommercial — You may not use the material for commercial purposes.
+  - No additional restrictions — You may not apply legal terms or technological
+    measures that legally restrict others from doing anything the license permits.
+
+------------------------------------------------------------------------------
+SOURCE-MATERIAL NOTICE
+------------------------------------------------------------------------------
+This dataset is derived from videos published on https://www.ted.com which are
+themselves licensed under CC-BY-NC-ND 4.0 by TED Conferences, LLC. The tracking
+parameters, JPG frames, alpha mattes, and audio extracts in this dataset are
+derivative works of those videos. Use of this dataset must therefore comply
+with both this CC-BY-NC-4.0 license AND the upstream CC-BY-NC-ND restrictions
+on the source material:
+
+  - You may NOT use this dataset for commercial purposes.
+  - You MUST credit "TED" as the source of the original video content in any
+    publication, demo, or derivative work.
+  - You SHOULD link back to the original TED talk page for any individual
+    speaker whose data you use in a publication, demo, or derivative work.
+
+This notice does not constitute legal advice. If your intended use is unclear,
+consult a lawyer or contact TED directly.

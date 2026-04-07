@@ -8,15 +8,15 @@
 
 ## Introduction
 
-HolisticTracker is a 3-stage expressive human body tracking pipeline that estimates **SMPL-X + FLAME** mesh parameters from monocular video. It was developed for building the [TEDWB1k](https://github.com/nickneil/TEDWB1k) dataset and training [HolisticAvatar](https://github.com/nickneil/HolisticAvatar).
+HolisticTracker is a 3-stage expressive human body tracking pipeline that estimates **SMPL-X + FLAME** mesh parameters from monocular video. It was developed for building the [TEDWB1k](https://huggingface.co/datasets/initialneil/TEDWB1k) dataset and training [HolisticAvatar](https://github.com/initialneil/HolisticAvatar).
 
 The pipeline adopts the **Expressive Human Model (EHM)** representation from [GUAVA](https://github.com/Pixel-Talk/GUAVA), which jointly optimizes SMPL-X body and FLAME head parameters in a unified mesh. The tracker extends this with multi-stage optimization and temporal smoothness for robust video-level tracking.
 
 ### Pipeline Stages
 
-1. **Track Base** (`infer_ehmx_track_base.py`): Body detection, keypoint estimation (Sapiens), and initial SMPL-X fitting via [PIXIE](https://pixie.is.tue.mpg.de/).
-2. **FLAME Refinement** (`infer_ehmx_flame.py`): Refines head/face parameters using FLAME-specific landmarks and [pixel3dmm](https://github.com/SimonGiebenhain/pixel3dmm) for dense face alignment.
-3. **SMPL-X Optimization** (`infer_ehmx_smplx.py`): Joint optimization of full-body SMPL-X parameters with per-frame and temporal losses.
+1. **Track Base** (`infer_ehmx_track_base.py`): Per-frame perception — body bbox, [Sapiens](https://github.com/facebookresearch/sapiens) 1B 133-keypoint detection, [HaMeR](https://github.com/geopavlakos/hamer) for per-hand MANO regression, MediaPipe FaceMesh for 478-point face landmarks, plus 70 / 203-point face landmark models. SMPL-X is initialized with [PIXIE](https://pixie.is.tue.mpg.de/) and face / hand crops are computed from the keypoints.
+2. **FLAME Refinement** (`infer_ehmx_flame.py`): Refines head / jaw / expression / eye / eyelid parameters using FLAME-specific landmarks and [pixel3dmm](https://github.com/SimonGiebenhain/pixel3dmm) for dense face alignment.
+3. **SMPL-X Optimization** (`infer_ehmx_smplx.py`): Joint optimization of full-body SMPL-X parameters (body, hands, expression) with per-frame and temporal losses, consistent with the FLAME face fit.
 
 ### Features
 
